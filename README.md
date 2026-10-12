@@ -156,7 +156,7 @@ DATA_INGESTION_ORCHESTRATOR/
   pip install teradatasql
   ```
 - **Teradata Vantage Client (TTU)**: Teradata Parallel Transporter (`tbuild`) and `bteq` must be installed and accessible in the system `$PATH`.
-- **Generic TPT Loader**: `TPT_SCRIPT_v3` deployed and accessible on the local filesystem.
+- **Generic TPT Loader**: `TPT_LOADER` deployed and accessible on the local filesystem.
 
 ---
 
@@ -211,8 +211,8 @@ The configuration file is organized into three decoupled functional blocks:
     "technical_database": "globalmart_tch"
   },
   "tpt": {
-    "wrapper_script": "../TPT_SCRIPT_v3/load_csv_generic.sh",
-    "unlock_script": "../TPT_SCRIPT_v3/unlock_tpt_table.sh",
+    "wrapper_script": "../TPT_LOADER/load_csv_generic.sh",
+    "unlock_script": "../TPT_LOADER/unlock_tpt_table.sh",
     "timeout_seconds": 3600,
     "target_db": "globalmart_stg",
     "work_db": "globalmart_wrk",
