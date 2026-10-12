@@ -1,0 +1,41 @@
+{
+  "teradata": {
+    "host": "<YOUR_HOST>",
+    "user": "<YOUR_USER>",
+    "pass_file": "/path/to/pass.txt",
+    "key_file": "/path/to/key.txt",
+    "logmech": "TD2",
+    "technical_database": "<TECH_DB>"
+  },
+  "tpt": {
+    "wrapper_script": "/path/to/load_csv_generic.sh",
+    "unlock_script": "/path/to/unlock_tpt_table.sh",
+    "timeout_seconds": 3600,
+    "target_db": "<TARGET_DB>",
+    "work_db": "<WORK_DB>",
+    "default_load_mode": "replace"
+  },
+  "orchestration": {
+    "landing_zone": "/path/to/landing",
+    "loading_zone": "/path/to/loading",
+    "archive_zone": "/path/to/archive",
+    "logs_dir": "/path/to/logs",
+    "max_concurrent_jobs": 5,
+    "manifest_pattern": "MANIFEST_*.MF",
+    "manifest_regex": "^MANIFEST_([A-Za-z0-9_]+)_(\\d{8}_\\d{6})_([A-Za-z0-9_-]+)\\.MF$",
+    "entity_mapping_file": "entity_mapping.csv",
+    "verify_checksum": true,
+    "allow_orphan_files": false,
+    "post_ingestion_tasks": [
+      {
+        "type": "dbt",
+        "project_dir": "/path/to/dbt/project",
+        "profiles_dir": "/path/to/dbt/profiles"
+      },
+      {
+        "type": "shell",
+        "command": "echo 'Ingestion completed for batch $CURRENT_BATCH_ID from source $CURRENT_SOURCE'"
+      }
+    ]
+  }
+}
