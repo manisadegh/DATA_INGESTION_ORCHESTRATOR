@@ -11,14 +11,19 @@ def current_timestamp_str():
 
 class TeradataStateDB:
     def __init__(self, td_config):
-        self.host = td_config['host']
-        self.user = td_config['user']
+        self.host = td_config.get('host') or os.environ.get('TDPID')
+        env_user = f"{os.environ.get('TDENV', '')}{os.environ.get('SID_ADM_USER', '')}" if os.environ.get("SID_ADM_USER") else os.environ.get("USER")
+        self.user = td_config.get('user') or env_user
         
-        # Support either plain-text password or encrypted pass/key files (TJEncryptPassword)
-        if 'pass_file' in td_config and 'key_file' in td_config:
-            self.password = f"ENCRYPTED_PASSWORD(file:{td_config['pass_file']},file:{td_config['key_file']})"
-        else:
+        # Support either plain-text password, direct ENCRYPTED_PASSWORD, or encrypted pass/key files (TJEncryptPassword)
+        if 'key_file' in td_config and 'pass_file' in td_config:
+            self.password = f"ENCRYPTED_PASSWORD(file:{td_config['key_file']},file:{td_config['pass_file']})"
+        elif 'pass_file' in td_config and 'key_file' in td_config:
+            self.password = f"ENCRYPTED_PASSWORD(file:{td_config['key_file']},file:{td_config['pass_file']})"
+        elif td_config.get('password'):
             self.password = td_config.get('password')
+        else:
+            self.password = os.environ.get('TD_PASSWORD')
             
         self.logmech = td_config.get('logmech', 'TD2')
         self.tech_db = td_config['technical_database']
