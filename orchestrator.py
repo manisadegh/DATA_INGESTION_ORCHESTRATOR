@@ -4,6 +4,7 @@ import sys
 import os
 import shutil
 import argparse
+import zipfile
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -56,28 +57,51 @@ def process_entity_task(entity, entity_info, batch_id, tpt_config, orch_config, 
     
     load_mode = tpt_config.get('default_load_mode') or orch_config.get('default_load_mode', 'replace')
     
-    # Multi-chunk header normalization (Solution A)
-    if len(files) == 1:
+    # Multi-chunk header normalization (Solution A) & ZIP Decompression
+    any_zip = any(f.lower().endswith('.zip') for f in files)
+    if any_zip:
+        extracted_csv_files = []
+        for f in files:
+            f_path = os.path.join(loading_zone, f)
+            if f.lower().endswith('.zip'):
+                with zipfile.ZipFile(f_path, 'r') as z:
+                    for m in z.namelist():
+                        if m.lower().endswith('.csv'):
+                            base_m = os.path.basename(m)
+                            out_p = os.path.join(loading_zone, base_m)
+                            if not os.path.exists(out_p):
+                                with z.open(m) as zf, open(out_p, 'wb') as out_f:
+                                    shutil.copyfileobj(zf, out_f)
+                            extracted_csv_files.append(base_m)
+            elif f.lower().endswith('.csv'):
+                extracted_csv_files.append(f)
+        data_files = sorted(list(set(extracted_csv_files)))
+        data_ext = ".csv"
+    else:
+        data_files = files
+        data_ext = extension
+
+    if len(data_files) == 1:
         # Single file: standard load with SkipRows = 1
-        target_spec = files[0]
+        target_spec = data_files[0]
         skip_rows = 1
         skip_rows_every_file = "N"
     else:
         # Multi-chunks: check if files are CSV
-        all_csv = all(f.lower().endswith('.csv') for f in files)
+        all_csv = all(f.lower().endswith('.csv') for f in data_files)
         if all_csv:
             # Strip header from the first chunk in LOADING_ZONE
-            chunk_1_path = os.path.join(loading_zone, files[0])
+            chunk_1_path = os.path.join(loading_zone, data_files[0])
             strip_header_in_place(chunk_1_path)
             
             # Wildcard matching all chunks for this entity
-            target_spec = f"*{signature}*{extension}"
+            target_spec = f"*{signature}*{data_ext}"
             skip_rows = 0
             skip_rows_every_file = "N"
-            logger.info(f"[{entity}] Multi-chunk detected ({len(files)} files). First chunk header stripped; loading with SkipRows=0.")
+            logger.info(f"[{entity}] Multi-chunk detected ({len(data_files)} files). First chunk header stripped; loading with SkipRows=0.")
         else:
             # For non-csv or compressed files, target wildcard with SkipRows=1
-            target_spec = f"*{signature}*{extension}"
+            target_spec = f"*{signature}*{data_ext}"
             skip_rows = 1
             skip_rows_every_file = "N"
             
@@ -294,6 +318,16 @@ def main():
                 marker_path = os.path.join(loading_zone, "." + f + ".header_stripped")
                 if os.path.exists(marker_path):
                     os.remove(marker_path)
+                    
+            # Clean up any remaining temporary extracted files or markers in loading_zone
+            if os.path.exists(loading_zone):
+                for item in os.listdir(loading_zone):
+                    item_path = os.path.join(loading_zone, item)
+                    if os.path.isfile(item_path):
+                        try:
+                            os.remove(item_path)
+                        except Exception as e:
+                            logger.warning(f"Could not remove temporary file {item_path}: {e}")
                     
             db.finish_batch(batch_id, 'SUCCESS')
             logger.info(f"[SUCCESS] Pipeline completed successfully for batch {batch_id}!")

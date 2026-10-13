@@ -104,10 +104,12 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
     
     try:
         logger.info(f"Executing: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, env=tpt_env, timeout=timeout_sec)
+        result = subprocess.run(cmd, capture_output=True, text=True, errors='replace', env=tpt_env, timeout=timeout_sec)
         
         # 2. Reactive Unlock (Error 2652 detected)
-        if result.returncode not in [0, 4] and ("2652" in result.stdout or "2652" in result.stderr or "Table is being Loaded" in result.stderr):
+        stdout_str = result.stdout or ""
+        stderr_str = result.stderr or ""
+        if result.returncode not in [0, 4] and ("2652" in stdout_str or "2652" in stderr_str or "Table is being Loaded" in stderr_str):
             if unlock_cmd:
                 logger.warning(f"[{entity}] Error 2652 detected. Triggering reactive unlock and retrying...")
                 try:
