@@ -11,9 +11,16 @@ def current_timestamp_str():
 
 class TeradataStateDB:
     def __init__(self, td_config):
-        self.host = td_config.get('host') or os.environ.get('TDPID')
+        if td_config is None:
+            td_config = {}
+        self.host = td_config.get('host') or td_config.get('server') or td_config.get('tdpid') or os.environ.get('TDPID')
+        if not self.host:
+            raise ValueError("Teradata host/server not configured. Provide 'host' (or 'server') in config.json or export TDPID.")
+
         env_user = f"{os.environ.get('TDENV', '')}{os.environ.get('SID_ADM_USER', '')}" if os.environ.get("SID_ADM_USER") else os.environ.get("USER")
-        self.user = td_config.get('user') or env_user
+        self.user = td_config.get('user') or td_config.get('username') or env_user
+        if not self.user:
+            raise ValueError("Teradata user not configured. Provide 'user' in config.json or export TDENV and SID_ADM_USER.")
         
         # Support either plain-text password, direct ENCRYPTED_PASSWORD, or encrypted pass/key files (TJEncryptPassword)
         if 'key_file' in td_config and 'pass_file' in td_config:
@@ -23,10 +30,16 @@ class TeradataStateDB:
         elif td_config.get('password'):
             self.password = td_config.get('password')
         else:
-            self.password = os.environ.get('TD_PASSWORD')
+            dbt_dir = os.environ.get("DBT_PROFILE_DIR") or os.path.expanduser("~/.dbt")
+            auto_key = os.path.join(dbt_dir, f"{self.user}_Key.properties")
+            auto_pass = os.path.join(dbt_dir, f"{self.user}_Pass.properties")
+            if os.path.exists(auto_key) and os.path.exists(auto_pass):
+                self.password = f"ENCRYPTED_PASSWORD(file:{auto_key},file:{auto_pass})"
+            else:
+                self.password = os.environ.get('TD_PASSWORD')
             
         self.logmech = td_config.get('logmech', 'TD2')
-        self.tech_db = td_config['technical_database']
+        self.tech_db = td_config.get('technical_database') or td_config.get('target_db') or os.environ.get('TD_TECH_DB', 'globalmart_tch')
         if not re.match(r'^[A-Za-z0-9_]+$', self.tech_db):
             raise ValueError(f"Invalid database identifier: '{self.tech_db}'")
 

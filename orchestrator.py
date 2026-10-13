@@ -154,20 +154,25 @@ def main():
 
     # Setup TPT Env vars globally
     tpt_env = os.environ.copy()
-    if 'host' in config.get('teradata', {}):
-        tpt_env['TDPID'] = config['teradata']['host']
-        pwd = config['teradata'].get('password', '')
-        if pwd and not pwd.startswith('ENCRYPTED_PASSWORD'):
-            tpt_env['TD_PASSWORD'] = pwd
-        elif 'TD_PASSWORD' in tpt_env:
-            del tpt_env['TD_PASSWORD']
-        tpt_env['SID_ADM_USER'] = config['teradata']['user']
-        tpt_env['USER'] = config['teradata']['user']
-        existing_wslenv = os.environ.get('WSLENV', '')
-        new_vars = 'TDPID/u:TD_PASSWORD/u:SID_ADM_USER/u:USER/u'
-        tpt_env['WSLENV'] = f"{existing_wslenv}:{new_vars}" if existing_wslenv else new_vars
-        orch_config['tpt_env'] = tpt_env
-        tpt_config['tpt_env'] = tpt_env
+    td_config = config.get('teradata', {})
+    host = td_config.get('host') or td_config.get('server') or td_config.get('tdpid') or os.environ.get('TDPID')
+    if host:
+        tpt_env['TDPID'] = host
+    pwd = td_config.get('password', '')
+    if pwd and not pwd.startswith('ENCRYPTED_PASSWORD'):
+        tpt_env['TD_PASSWORD'] = pwd
+    elif 'TD_PASSWORD' in tpt_env:
+        del tpt_env['TD_PASSWORD']
+    env_user = f"{os.environ.get('TDENV', '')}{os.environ.get('SID_ADM_USER', '')}" if os.environ.get('SID_ADM_USER') else os.environ.get('USER')
+    user = td_config.get('user') or td_config.get('username') or env_user
+    if user:
+        tpt_env['SID_ADM_USER'] = user
+        tpt_env['USER'] = user
+    existing_wslenv = os.environ.get('WSLENV', '')
+    new_vars = 'TDPID/u:TD_PASSWORD/u:SID_ADM_USER/u:USER/u'
+    tpt_env['WSLENV'] = f"{existing_wslenv}:{new_vars}" if existing_wslenv else new_vars
+    orch_config['tpt_env'] = tpt_env
+    tpt_config['tpt_env'] = tpt_env
 
     manifest_pattern = orch_config.get('manifest_pattern', 'MANIFEST_*.MF')
 
