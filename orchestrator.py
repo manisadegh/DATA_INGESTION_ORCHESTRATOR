@@ -79,7 +79,7 @@ def process_entity_task(entity, entity_info, batch_id, tpt_config, orch_config, 
         data_ext = ".csv"
     else:
         data_files = files
-        data_ext = extension
+        data_ext = os.path.splitext(data_files[0])[1] if data_files else ".csv"
 
     if len(data_files) == 1:
         # Single file: standard load with SkipRows = 1
