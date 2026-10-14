@@ -1,0 +1,18 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary, runtime, and marker files
+*.log
+*.tmp
+.*.header_stripped
+logs/
+.DS_Store
+Thumbs.db
+
+# Environments
+.env
+.venv
+env/
+venv/
