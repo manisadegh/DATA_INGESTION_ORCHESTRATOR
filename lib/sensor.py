@@ -4,6 +4,7 @@ import os
 import re
 import csv
 import hashlib
+import zipfile
 from datetime import datetime
 
 logger = logging.getLogger("DATA_INGESTION_ORCHESTRATOR")
@@ -183,34 +184,43 @@ def verify_and_map_batch(landing_zone, manifest_entries, mapping_file, verify_ch
         if orphan_files:
             raise ValueError(f"Boundary violation (OPS-01): Unmanifested orphan file(s) found in landing zone: {orphan_files}")
 
-    # 5. Entity mapping check (supports SOURCE column for multi-source single target)
+    # 5. Entity mapping check (supports SOURCE column and INNER_EXTENSION for .csv vs .pecsv)
+    def inspect_file_inner_extension(file_path):
+        lower_p = file_path.lower()
+        if lower_p.endswith(".zip") and os.path.exists(file_path):
+            try:
+                with zipfile.ZipFile(file_path, "r") as z:
+                    names = [n.lower() for n in z.namelist()]
+                    if any(n.endswith(".pecsv") for n in names):
+                        return ".pecsv"
+                    if any(n.endswith(".csv") for n in names):
+                        return ".csv"
+                    if names:
+                        return os.path.splitext(names[0])[1]
+            except Exception as e:
+                logger.warning(f"Unable to inspect ZIP archive '{file_path}': {e}")
+        return os.path.splitext(file_path)[1].lower()
+
     mapping_rules = []
     with open(mapping_file, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            tgt = ""
-            sig = ""
-            ext = ""
-            src = ""
-            for k, v in row.items():
-                if not k or not v:
-                    continue
-                k_clean = k.strip().upper()
-                v_clean = v.strip()
-                if k_clean == 'TARGET_TABLE':
-                    tgt = v_clean
-                elif k_clean == 'FILE_SIGNATURE':
-                    sig = v_clean
-                elif k_clean == 'EXTENSION':
-                    ext = v_clean
-                elif k_clean == 'SOURCE':
-                    src = v_clean
+            normalized = {k.strip().upper(): v.strip() for k, v in row.items() if k and v}
+            tgt = normalized.get("TARGET_TABLE", "")
+            sig = normalized.get("FILE_SIGNATURE", "")
+            ext = normalized.get("EXTENSION", ".csv")
+            inner_ext = normalized.get("INNER_EXTENSION", "").lower()
+            if not inner_ext:
+                inner_ext = ".csv"
+            src = normalized.get("SOURCE", "")
+
             if tgt and sig:
                 mapping_rules.append({
                     "source": src,
                     "target_table": tgt,
-                    "signature": sig,
-                    "extension": ext
+                    "signature": sig.lower(),
+                    "extension": ext.lower(),
+                    "inner_extension": inner_ext
                 })
 
     entities_workload = {}
@@ -219,26 +229,51 @@ def verify_and_map_batch(landing_zone, manifest_entries, mapping_file, verify_ch
         matched_entity = None
         matched_sig = None
         matched_ext = None
+        matched_inner_ext = None
         
+        full_fpath = os.path.join(landing_zone, fname)
+        actual_inner_ext = inspect_file_inner_extension(full_fpath)
+
+        # 1. First pass: exact match with source, signature, outer extension, and inner_extension
         for rule in mapping_rules:
-            # Source check: if batch source is specified and rule defines source(s)
             rule_src = rule.get("source", "").strip()
             if source and rule_src and rule_src != '*':
-                # Support comma-separated sources e.g. "ORACLE_FUSION, NETSUITE"
                 allowed_sources = [s.strip().upper() for s in rule_src.split(',') if s.strip()]
                 if source.strip().upper() not in allowed_sources:
                     continue
 
-            # Check if signature is part of filename
-            if rule["signature"] in fname:
-                # Extension check: exact extension or contained in comma-separated list or wildcard
-                ext_rule = rule["extension"].lower()
+            fname_lower = fname.lower()
+            if rule["signature"] in fname_lower:
+                ext_rule = rule["extension"]
+                ext_match = not ext_rule or ext_rule == '*' or fname_lower.endswith(ext_rule) or any(fname_lower.endswith(e.strip()) for e in ext_rule.split(','))
+                if ext_match:
+                    rule_inner = rule.get("inner_extension")
+                    if rule_inner and rule_inner == actual_inner_ext:
+                        matched_entity = rule["target_table"]
+                        matched_sig = rule["signature"]
+                        matched_ext = rule["extension"]
+                        matched_inner_ext = rule_inner
+                        break
+
+        # 2. Fallback pass without inner_extension (backward compatibility)
+        if not matched_entity:
+            for rule in mapping_rules:
+                rule_src = rule.get("source", "").strip()
+                if source and rule_src and rule_src != '*':
+                    allowed_sources = [s.strip().upper() for s in rule_src.split(',') if s.strip()]
+                    if source.strip().upper() not in allowed_sources:
+                        continue
+
                 fname_lower = fname.lower()
-                if not ext_rule or ext_rule == '*' or fname_lower.endswith(ext_rule) or any(fname_lower.endswith(e.strip()) for e in ext_rule.split(',')):
-                    matched_entity = rule["target_table"]
-                    matched_sig = rule["signature"]
-                    matched_ext = rule["extension"]
-                    break
+                if rule["signature"] in fname_lower:
+                    ext_rule = rule["extension"]
+                    ext_match = not ext_rule or ext_rule == '*' or fname_lower.endswith(ext_rule) or any(fname_lower.endswith(e.strip()) for e in ext_rule.split(','))
+                    if ext_match:
+                        matched_entity = rule["target_table"]
+                        matched_sig = rule["signature"]
+                        matched_ext = rule["extension"]
+                        matched_inner_ext = actual_inner_ext
+                        break
 
         if not matched_entity:
             if source:
@@ -251,7 +286,8 @@ def verify_and_map_batch(landing_zone, manifest_entries, mapping_file, verify_ch
                 "target_table": matched_entity,
                 "signature": matched_sig,
                 "files": [],
-                "extension": matched_ext
+                "extension": matched_ext,
+                "inner_extension": matched_inner_ext
             }
         entities_workload[matched_entity]["files"].append(fname)
 

@@ -60,26 +60,30 @@ def process_entity_task(entity, entity_info, batch_id, tpt_config, orch_config, 
     # Multi-chunk header normalization (Solution A) & ZIP Decompression
     any_zip = any(f.lower().endswith('.zip') for f in files)
     if any_zip:
-        extracted_csv_files = []
+        extracted_files = []
         for f in files:
             f_path = os.path.join(loading_zone, f)
             if f.lower().endswith('.zip'):
                 with zipfile.ZipFile(f_path, 'r') as z:
                     for m in z.namelist():
-                        if m.lower().endswith('.csv'):
+                        if m.lower().endswith(('.csv', '.pecsv')):
                             base_m = os.path.basename(m)
+                            if not base_m:
+                                continue
                             out_p = os.path.join(loading_zone, base_m)
                             if not os.path.exists(out_p):
                                 with z.open(m) as zf, open(out_p, 'wb') as out_f:
                                     shutil.copyfileobj(zf, out_f)
-                            extracted_csv_files.append(base_m)
-            elif f.lower().endswith('.csv'):
-                extracted_csv_files.append(f)
-        data_files = sorted(list(set(extracted_csv_files)))
-        data_ext = ".csv"
+                            extracted_files.append(base_m)
+            elif f.lower().endswith(('.csv', '.pecsv')):
+                extracted_files.append(f)
+            else:
+                extracted_files.append(f)
+        data_files = sorted(list(set(extracted_files)))
+        data_ext = os.path.splitext(data_files[0])[1].lower() if data_files else ".csv"
     else:
         data_files = files
-        data_ext = os.path.splitext(data_files[0])[1] if data_files else ".csv"
+        data_ext = os.path.splitext(data_files[0])[1].lower() if data_files else ".csv"
 
     if len(data_files) == 1:
         # Single file: standard load with SkipRows = 1
@@ -87,9 +91,9 @@ def process_entity_task(entity, entity_info, batch_id, tpt_config, orch_config, 
         skip_rows = 1
         skip_rows_every_file = "N"
     else:
-        # Multi-chunks: check if files are CSV
-        all_csv = all(f.lower().endswith('.csv') for f in data_files)
-        if all_csv:
+        # Multi-chunks: check if files are delimited text (.csv, .pecsv)
+        all_delimited = all(f.lower().endswith(('.csv', '.pecsv')) for f in data_files)
+        if all_delimited:
             # Strip header from the first chunk in LOADING_ZONE
             chunk_1_path = os.path.join(loading_zone, data_files[0])
             strip_header_in_place(chunk_1_path)
@@ -100,7 +104,7 @@ def process_entity_task(entity, entity_info, batch_id, tpt_config, orch_config, 
             skip_rows_every_file = "N"
             logger.info(f"[{entity}] Multi-chunk detected ({len(data_files)} files). First chunk header stripped; loading with SkipRows=0.")
         else:
-            # For non-csv or compressed files, target wildcard with SkipRows=1
+            # For non-delimited or compressed files, target wildcard with SkipRows=1
             target_spec = f"*{signature}*{data_ext}"
             skip_rows = 1
             skip_rows_every_file = "N"

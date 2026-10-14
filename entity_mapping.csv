@@ -1,3 +1,5 @@
-SOURCE,TARGET_TABLE,FILE_SIGNATURE,EXTENSION
-ORACLE_FUSION,ERP_MSH_INVOICE_HEADER,invoiceheaderextractpvo,".csv,.zip"
-ORACLE_FUSION,ERP_MSH_USER,userpvo,".csv,.zip"
+SOURCE,TARGET_TABLE,FILE_SIGNATURE,EXTENSION,INNER_EXTENSION
+ORACLE_FUSION,ERP_MSH_INVOICE_HEADER,invoiceheaderextractpvo,".csv,.zip",.csv
+ORACLE_FUSION,ERP_MSH_INVOICE_HEADER_AK,invoiceheaderextractpvo,".pecsv,.zip",.pecsv
+ORACLE_FUSION,ERP_MSH_USER,userpvo,".csv,.zip",.csv
+ORACLE_FUSION,ERP_MSH_USER_AK,userpvo,".pecsv,.zip",.pecsv
