@@ -162,7 +162,7 @@ DATA_INGESTION_ORCHESTRATOR/
 
 ## Database Setup (DDLs)
 
-Run the DDLs in your Teradata technical schema (`<TECH_DB>`, e.g., `globalmart_tch`) before launching the orchestrator:
+Run the DDLs in your Teradata technical schema (`<TECH_DB>`, e.g., `${TDENV}SIDFINTCH`) before launching the orchestrator:
 
 ```sql
 -- 1. BATCH_RUNS: High-level execution status per batch
@@ -204,18 +204,18 @@ The configuration file is organized into three decoupled functional blocks:
 ```json
 {
   "teradata": {
-    "host": "ms-env-ox1ux8g51742ej2y.env.trial.teradata.com",
-    "user": "demo_user",
+    "host": "<TERADATA_HOST>",
+    "user": "<USER>",
     "password": "<YourPassword>",
     "logmech": "TD2",
-    "technical_database": "globalmart_tch"
+    "technical_database": "DEV0SIDFINTCH"
   },
   "tpt": {
     "wrapper_script": "../TPT_LOADER/load_csv_generic.sh",
     "unlock_script": "../TPT_LOADER/unlock_tpt_table.sh",
     "timeout_seconds": 3600,
-    "target_db": "globalmart_stg",
-    "work_db": "globalmart_wrk",
+    "target_db": "DEV0SIDFINSTG",
+    "work_db": "DEV0SIDFINWRK",
     "default_load_mode": "replace"
   },
   "orchestration": {
@@ -372,8 +372,8 @@ Post-ingestion tasks are executed **only if 100% of entity tasks reach `SUCCESS`
   ```
 - **Database Audit Trail**: Queryable at any time in Teradata:
   ```sql
-  SELECT * FROM globalmart_tch.BATCH_RUNS ORDER BY START_TIME DESC;
-  SELECT * FROM globalmart_tch.BATCH_TASKS WHERE BATCH_ID = '1003';
+  SELECT * FROM DEV0SIDFINTCH.BATCH_RUNS ORDER BY START_TIME DESC;
+  SELECT * FROM DEV0SIDFINTCH.BATCH_TASKS WHERE BATCH_ID = '1003';
   ```
 
 ---

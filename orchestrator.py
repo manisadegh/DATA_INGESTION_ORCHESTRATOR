@@ -120,6 +120,16 @@ def process_entity_task(entity, entity_info, batch_id, tpt_config, orch_config, 
     
     return success
 
+def expand_env_vars(data):
+    """Recursively expands ${VAR} or $VAR environment variables in configuration strings."""
+    if isinstance(data, str):
+        return os.path.expandvars(data)
+    elif isinstance(data, dict):
+        return {k: expand_env_vars(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [expand_env_vars(v) for v in data]
+    return data
+
 def main():
     # 1. Bootstrap Logger
     logger = setup_logger()
@@ -130,27 +140,36 @@ def main():
 
     # 2. Load Configuration
     try:
-        with open(args.config, "r") as f:
-            config = json.load(f)
+        with open(args.config, "r", encoding="utf-8") as f:
+            config = expand_env_vars(json.load(f))
     except Exception as e:
         logger.critical(f"Failed to load configuration file {args.config}: {e}")
         sys.exit(1)
 
     tpt_config = config.get('tpt', {})
     orch_config = config.get('orchestration', {})
+    base_dir = os.path.dirname(os.path.abspath(args.config))
+
+    for key in ['landing_zone', 'loading_zone', 'archive_zone', 'logs_dir']:
+        if orch_config.get(key) and not os.path.isabs(orch_config[key]):
+            orch_config[key] = os.path.normpath(os.path.join(base_dir, orch_config[key]))
+
     landing_zone = orch_config.get('landing_zone')
-    loading_zone = orch_config.get('loading_zone', '../LOADING_ZONE')
-    archive_zone = orch_config.get('archive_zone', '../ARCHIVE_ZONE')
-    logs_dir = orch_config.get('logs_dir', '../LOGS')
+    loading_zone = orch_config.get('loading_zone', os.path.normpath(os.path.join(base_dir, '../LOADING_ZONE')))
+    archive_zone = orch_config.get('archive_zone', os.path.normpath(os.path.join(base_dir, '../ARCHIVE_ZONE')))
+    logs_dir = orch_config.get('logs_dir', os.path.normpath(os.path.join(base_dir, '../LOGS')))
     
     if not landing_zone:
         logger.critical("Configuration error: 'landing_zone' is required.")
         sys.exit(1)
-        
-    base_dir = os.path.dirname(args.config)
+
+    for key in ['wrapper_script', 'unlock_script']:
+        if tpt_config.get(key) and not os.path.isabs(tpt_config[key]):
+            tpt_config[key] = os.path.normpath(os.path.join(base_dir, tpt_config[key]))
+
     mapping_file = orch_config.get('entity_mapping_file', 'entity_mapping.csv')
-    if base_dir and not os.path.isabs(mapping_file):
-        mapping_file = os.path.join(base_dir, mapping_file)
+    if not os.path.isabs(mapping_file):
+        mapping_file = os.path.normpath(os.path.join(base_dir, mapping_file))
 
     # Setup TPT Env vars globally
     tpt_env = os.environ.copy()
@@ -168,9 +187,6 @@ def main():
     if user:
         tpt_env['SID_ADM_USER'] = user
         tpt_env['USER'] = user
-    existing_wslenv = os.environ.get('WSLENV', '')
-    new_vars = 'TDPID/u:TD_PASSWORD/u:SID_ADM_USER/u:USER/u'
-    tpt_env['WSLENV'] = f"{existing_wslenv}:{new_vars}" if existing_wslenv else new_vars
     orch_config['tpt_env'] = tpt_env
     tpt_config['tpt_env'] = tpt_env
 
@@ -178,7 +194,7 @@ def main():
 
     # 3. Check for In-Flight Batch in LOADING_ZONE (Crash Recovery)
     in_flight_manifests = [
-        os.path.join(loading_zone, f).replace('\\', '/')
+        os.path.join(loading_zone, f)
         for f in os.listdir(loading_zone)
         if f.endswith('.MF')
     ] if os.path.exists(loading_zone) else []
@@ -305,7 +321,7 @@ def main():
         post_tasks = orch_config.get('post_ingestion_tasks', [])
         os.environ['CURRENT_BATCH_ID'] = str(batch_id)
         os.environ['CURRENT_SOURCE'] = str(source)
-        os.environ['CURRENT_MANIFEST'] = os.path.join(loading_zone, manifest_basename).replace('\\', '/')
+        os.environ['CURRENT_MANIFEST'] = os.path.join(loading_zone, manifest_basename)
         
         post_success = run_post_tasks(post_tasks) if post_tasks else True
         if post_success:

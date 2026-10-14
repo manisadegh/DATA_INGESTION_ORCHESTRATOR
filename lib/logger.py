@@ -30,7 +30,7 @@ def add_batch_file_logger(logs_dir, source, extract_timestamp, batch_id):
     clean_batch = str(batch_id).replace("/", "_").replace("\\", "_")
     
     log_filename = f"orchestrator_{clean_src}_{clean_ext}_{clean_batch}_{execution_ts}.log"
-    log_filepath = os.path.join(logs_dir, log_filename).replace("\\", "/")
+    log_filepath = os.path.join(logs_dir, log_filename)
     
     file_handler = logging.FileHandler(log_filepath, encoding="utf-8")
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT))

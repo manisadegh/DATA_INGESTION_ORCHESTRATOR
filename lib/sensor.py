@@ -28,11 +28,11 @@ def scan_landing_zone(landing_zone, manifest_pattern="MANIFEST_*.MF"):
     
     # Search for manifests matching pattern
     search_path = os.path.join(landing_zone, manifest_pattern)
-    found_manifests = [m.replace('\\', '/') for m in glob.glob(search_path)]
+    found_manifests = glob.glob(search_path)
     
     # Also catch any .MF files if pattern didn't match directly
     if not found_manifests:
-        found_manifests = [os.path.join(landing_zone, f).replace('\\', '/') for f in all_items if f.endswith('.MF')]
+        found_manifests = [os.path.join(landing_zone, f) for f in all_items if f.endswith('.MF')]
 
     manifest_basenames = set(os.path.basename(m) for m in found_manifests)
     data_files = [f for f in all_items if f not in manifest_basenames]

@@ -39,9 +39,6 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
     else:
         tpt_env = tpt_env.copy()
         
-    if os.name == 'nt':
-        tpt_env['MSYS'] = 'noglob'
-    
     loading_zone = orch_config.get('loading_zone', orch_config.get('landing_zone'))
     
     # Check if full path already provided or relative to loading_zone
@@ -50,20 +47,7 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
     else:
         actual_file_path = f"{loading_zone}/{file_pattern_clean(file_path_or_pattern)}"
                 
-    bash_bin = "bash"
-    # Linux / POSIX is the primary production target.
-    # On Windows dev machines only, resolve Git Bash dynamically if present.
-    if os.name == 'nt':
-        local_app_data = os.environ.get('LOCALAPPDATA', '')
-        program_files = os.environ.get('ProgramFiles', r'C:\Program Files')
-        for candidate in [
-            os.path.join(local_app_data, r"Programs\Git\bin\bash.exe") if local_app_data else None,
-            os.path.join(program_files, r"Git\bin\bash.exe"),
-            os.path.join(program_files, r"Git\usr\bin\bash.exe")
-        ]:
-            if candidate and os.path.exists(candidate):
-                bash_bin = candidate
-                break
+    bash_bin = "/bin/bash"
 
     cmd = [
         bash_bin, script_path, 
@@ -147,5 +131,5 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
         return entity, False
 
 def file_pattern_clean(f):
-    """Ensures forward slash consistency."""
-    return f.replace('\\', '/')
+    """Returns normalized pattern."""
+    return f

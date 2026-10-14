@@ -1,3 +1,4 @@
+import os
 import logging
 from datetime import datetime
 import teradatasql
@@ -39,7 +40,8 @@ class TeradataStateDB:
                 self.password = os.environ.get('TD_PASSWORD')
             
         self.logmech = td_config.get('logmech', 'TD2')
-        self.tech_db = td_config.get('technical_database') or td_config.get('target_db') or os.environ.get('TD_TECH_DB', 'globalmart_tch')
+        default_tech_db = f"{os.environ.get('TDENV', '')}{os.environ.get('DB_TCH', 'SIDFINTCH')}"
+        self.tech_db = td_config.get('technical_database') or os.environ.get('TD_TECH_DB', default_tech_db)
         if not re.match(r'^[A-Za-z0-9_]+$', self.tech_db):
             raise ValueError(f"Invalid database identifier: '{self.tech_db}'")
 
