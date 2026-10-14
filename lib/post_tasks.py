@@ -1,6 +1,7 @@
 import logging
 import subprocess
 import os
+import sys
 
 logger = logging.getLogger("DATA_INGESTION_ORCHESTRATOR")
 
@@ -79,7 +80,7 @@ def _run_python_task(task):
         return False
         
     logger.info(f"Executing python script: {script_path}")
-    res = subprocess.run(["python", script_path], capture_output=True, text=True)
+    res = subprocess.run([sys.executable, script_path], capture_output=True, text=True)
     if res.returncode != 0:
         logger.error(f"Python task failed (RC {res.returncode}):\n{res.stdout}\n{res.stderr}")
         return False
