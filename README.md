@@ -1,7 +1,7 @@
 # Data Ingestion Orchestrator
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![Platform: Linux / Git Bash / WSL](https://img.shields.io/badge/platform-Linux%20%7C%20Git%20Bash%20%7C%20WSL-lightgrey.svg)](https://www.kernel.org/)
+[![Platform: Linux / POSIX](https://img.shields.io/badge/platform-Linux%20%7C%20POSIX-lightgrey.svg)](https://www.kernel.org/)
 [![Database: Teradata Vantage](https://img.shields.io/badge/database-Teradata%20Vantage%2016.20+-orange.svg)](https://www.teradata.com/)
 [![License: Proprietary](https://img.shields.io/badge/license-Proprietary-red.svg)](#)
 
