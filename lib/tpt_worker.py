@@ -4,7 +4,7 @@ import os
 
 logger = logging.getLogger("DATA_INGESTION_ORCHESTRATOR")
 
-def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_config=None, orch_config=None, db_state=None, load_mode="replace", skip_rows=1, skip_rows_every_file="N"):
+def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_config=None, orch_config=None, db_state=None, load_mode="replace", skip_rows=1, skip_rows_every_file="N", extract_timestamp=None):
     """
     Executes the bash wrapper for TPT in a subprocess with auto-healing.
     Operates strictly in the isolated LOADING_ZONE for a Single Batch.
@@ -20,7 +20,8 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
         orch_config = tpt_config
         tpt_config = {}
 
-    logger.info(f"Starting TPT for entity '{entity}' (Batch {batch_id}, Retry {retry_count}, Mode {load_mode}, SkipRows {skip_rows})")
+    ts_info = f", ExtractTS '{extract_timestamp}'" if extract_timestamp else ""
+    logger.info(f"Starting TPT for entity '{entity}' (Batch {batch_id}{ts_info}, Retry {retry_count}, Mode {load_mode}, SkipRows {skip_rows})")
     
     # Mark task start in DB
     if db_state:
@@ -57,6 +58,8 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
         "-m", load_mode,
         "-S", str(skip_rows)
     ]
+    if extract_timestamp:
+        cmd.extend(["-T", str(extract_timestamp)])
     
     if target_db and work_db:
         cmd.extend([

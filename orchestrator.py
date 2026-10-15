@@ -40,7 +40,7 @@ def strip_header_in_place(file_path):
     with open(marker, 'w') as f:
         f.write("STRIPPED\n")
 
-def process_entity_task(entity, entity_info, batch_id, tpt_config, orch_config, db):
+def process_entity_task(entity, entity_info, batch_id, extract_timestamp, tpt_config, orch_config, db):
     """
     Ingests all files for a given entity in the isolated LOADING_ZONE.
     Handles single files vs multi-chunk extracts and header normalization.
@@ -133,7 +133,8 @@ def process_entity_task(entity, entity_info, batch_id, tpt_config, orch_config, 
         db_state=db,
         load_mode=load_mode,
         skip_rows=skip_rows,
-        skip_rows_every_file=skip_rows_every_file
+        skip_rows_every_file=skip_rows_every_file,
+        extract_timestamp=extract_timestamp
     )
     
     return success
@@ -319,7 +320,7 @@ def main():
             futures = {}
             for entity in pending_entities:
                 entity_info = entities_workload[entity]
-                futures[executor.submit(process_entity_task, entity, entity_info, batch_id, tpt_config, orch_config, db)] = entity
+                futures[executor.submit(process_entity_task, entity, entity_info, batch_id, extract_ts, tpt_config, orch_config, db)] = entity
                 
             for future in as_completed(futures):
                 entity = futures[future]
