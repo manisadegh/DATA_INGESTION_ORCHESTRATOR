@@ -1,0 +1,34 @@
+{
+  "teradata": {
+    "host": "${TDPID}",
+    "user": "${TDENV}${SID_ADM_USER}",
+    "logmech": "TD2",
+    "technical_database": "${TDENV}SIDFINTCH"
+  },
+  "tpt": {
+    "wrapper_script": "../TPT_LOADER/load_csv_generic.sh",
+    "unlock_script": "../TPT_LOADER/unlock_tpt_table.sh",
+    "timeout_seconds": 3600,
+    "target_db": "${TDENV}SIDFINSTG",
+    "work_db": "${TDENV}SIDFINWRK",
+    "default_load_mode": "replace"
+  },
+  "orchestration": {
+    "landing_zone": "../../DATA/LANDING_ZONE",
+    "loading_zone": "../../DATA/LOADING_ZONE",
+    "archive_zone": "../../DATA/ARCHIVE_ZONE",
+    "logs_dir": "../../LOGS",
+    "max_concurrent_jobs": 4,
+    "manifest_pattern": "MANIFEST_*.MF",
+    "manifest_regex": "^MANIFEST_([A-Za-z0-9_]+)_(\\d{8}_\\d{6})_([A-Za-z0-9_-]+)\\.MF$",
+    "entity_mapping_file": "../../CONFIG/entity_mapping.csv",
+    "verify_checksum": true,
+    "allow_orphan_files": false,
+    "post_ingestion_tasks": [
+      {
+        "type": "shell",
+        "command": "echo 'Ingestion completed for batch $CURRENT_BATCH_ID from source $CURRENT_SOURCE'"
+      }
+    ]
+  }
+}
