@@ -4,6 +4,7 @@ import sys
 import os
 import shutil
 import argparse
+import gzip
 import zipfile
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -57,9 +58,9 @@ def process_entity_task(entity, entity_info, batch_id, tpt_config, orch_config, 
     
     load_mode = tpt_config.get('default_load_mode') or orch_config.get('default_load_mode', 'replace')
     
-    # Multi-chunk header normalization (Solution A) & ZIP Decompression
-    any_zip = any(f.lower().endswith('.zip') for f in files)
-    if any_zip:
+    # Multi-chunk header normalization (Solution A) & ZIP/GZ Decompression
+    any_archive = any(f.lower().endswith(('.zip', '.gz')) for f in files)
+    if any_archive:
         extracted_files = []
         for f in files:
             f_path = os.path.join(loading_zone, f)
@@ -75,6 +76,19 @@ def process_entity_task(entity, entity_info, batch_id, tpt_config, orch_config, 
                                 with z.open(m) as zf, open(out_p, 'wb') as out_f:
                                     shutil.copyfileobj(zf, out_f)
                             extracted_files.append(base_m)
+            elif f.lower().endswith('.gz'):
+                base_name = os.path.basename(f)
+                if base_name.lower().endswith(('.csv.gz', '.pecsv.gz')):
+                    out_name = base_name[:-3]
+                elif base_name.lower().endswith('.gz'):
+                    out_name = base_name[:-3] + '.csv'
+                else:
+                    out_name = base_name + '.csv'
+                out_p = os.path.join(loading_zone, out_name)
+                if not os.path.exists(out_p):
+                    with gzip.open(f_path, 'rb') as gf, open(out_p, 'wb') as out_f:
+                        shutil.copyfileobj(gf, out_f)
+                extracted_files.append(out_name)
             elif f.lower().endswith(('.csv', '.pecsv')):
                 extracted_files.append(f)
             else:
