@@ -126,9 +126,9 @@ classDiagram
 #### Class: `TeradataStateDB`
 - **Methods**:
   1. `connect() -> None`: Establishes session to Teradata Vantage using `teradatasql`. Supports `$tdwallet`, property files, or environment overrides.
-  2. `initialize_batch_run(batch_id, source, extract_timestamp) -> None`: Inserts or updates a row in `BATCH_RUNS` with `STATUS = 'RUNNING'`. Formats dates strictly to `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` to avoid Teradata Error 5404.
+  2. `initialize_batch_run(batch_id, source, extract_timestamp) -> None`: Inserts or updates a row in `BATCH_RUNS` with `STATUS = 'RUNNING'` and `PROCESS_PID = os.getpid()`. Formats dates strictly to `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` to avoid Teradata Error 5404.
   3. `initialize_batch_tasks(batch_id, source, extract_timestamp, entities_workload) -> None`: Inserts pending task records into `BATCH_TASKS`.
-  4. `update_batch_status(batch_id, status) -> None`: Commits terminal status (`SUCCESS` or `FAILED`) and sets `END_TIME`.
+  4. `update_batch_status(batch_id, status) -> None`: Commits terminal status (`SUCCESS` or `FAILED`), sets `END_TIME`, and preserves `PROCESS_PID` permanently without overwriting it to `NULL` (maintaining historical auditability).
   5. `update_task_status(batch_id, entity_name, file_name, status, error_message=None, retry_count=0) -> None`: Updates task record status and retry counters.
   6. `get_pending_tasks(batch_id) -> List[Tuple]`: Retrieves unfinished entity tasks for in-flight recovery.
   7. `is_batch_in_flight(batch_id) -> bool`: Checks if a batch was previously started and remains uncompleted.
@@ -157,7 +157,7 @@ classDiagram
 
 #### Functions in `lib/post_tasks.py`:
 1. `run_post_tasks(post_tasks_config: List[Dict], batch_metadata: Dict, logger) -> bool`
-   - **Description**: Iterates through configured post-tasks. Supports task type `"shell"` and `"dbt"`. Substitutes batch placeholders (e.g. `{batch_id}`, `{source}`, `{extract_timestamp}`) into commands. Executes via `subprocess.run()`. Returns `True` if all tasks succeed.
+   - **Description**: Iterates through configured post-tasks. Supports task type `"shell"` and `"dbt"`. Merges tasks from Orchestrator `config.json` with source-specific tasks passed via `--post-tasks-file <FILE>`. Substitutes batch placeholders (e.g. `{batch_id}`, `$CURRENT_BATCH_ID`, `{source}`, `{extract_timestamp}`) into commands. Executes via `subprocess.run()`. Returns `True` if all tasks succeed. Bypassed cleanly when `--skip-post-tasks` is specified.
 
 ---
 
@@ -188,9 +188,13 @@ CREATE MULTISET TABLE DEV0SIDFINTCH.BATCH_RUNS ,NO FALLBACK ,
         RUN_DATE DATE FORMAT 'YYYY-MM-DD',
         START_TIME TIMESTAMP(0),
         END_TIME TIMESTAMP(0),
-        STATUS VARCHAR(20) CHARACTER SET UNICODE NOT CASESPECIFIC NOT NULL
+        STATUS VARCHAR(20) CHARACTER SET UNICODE NOT CASESPECIFIC NOT NULL,
+        PROCESS_PID INTEGER
      )
-PRIMARY INDEX ( BATCH_ID );
+PRIMARY INDEX ( BATCH_ID ,SOURCE );
+
+-- Migration for existing environments:
+-- ALTER TABLE DEV0SIDFINTCH.BATCH_RUNS ADD PROCESS_PID INTEGER;
 
 CREATE MULTISET TABLE DEV0SIDFINTCH.BATCH_TASKS ,NO FALLBACK ,
      NO BEFORE JOURNAL,
@@ -209,5 +213,5 @@ CREATE MULTISET TABLE DEV0SIDFINTCH.BATCH_TASKS ,NO FALLBACK ,
         RETRY_COUNT INTEGER DEFAULT 0,
         ERROR_MESSAGE VARCHAR(1000) CHARACTER SET UNICODE NOT CASESPECIFIC
      )
-PRIMARY INDEX ( BATCH_ID ,ENTITY_NAME );
+PRIMARY INDEX ( BATCH_ID ,SOURCE );
 ```

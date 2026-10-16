@@ -107,6 +107,14 @@ cp /sg/local/sid/home/Dsidadm/DATA_LOADER/CONFIG/entity_mapping.csv "${TEST_DIR}
 | **TC-ORCH-06** | MD5 Checksum Tampering | Modified byte in data file | Checksum mismatch raised; aborts before TPT launch. | 1 |
 | **TC-ORCH-07** | Reactive Table Lock Recovery | Table locked in FastLoad Paused (2652) | Calls `unlock_tpt_table.sh`, releases lock, retries and succeeds. | 0 |
 | **TC-ORCH-08** | In-Flight Crash Resumption | Pre-existing files in `LOADING_ZONE` | Bypasses `LANDING_ZONE`, completes remaining tasks, archives batch. | 0 |
+| **TC-ORCH-09** | Concurrency & Active Polling Wait | 2 concurrent Orchestrator executions | Detects `.orchestrator.pid`, enters active polling loop until release. | 0 |
+| **TC-ORCH-10** | Hybrid Decoupling (`--skip-post-tasks`) | Batch with `--skip-post-tasks` | Ingests data, skips all post-tasks, logs bypass trace. | 0 |
+| **TC-ORCH-11** | Stale PID Cleanup & Crash Recovery | Pre-existing batch with dead PID in lockfile | Cleans dead PID lock, resumes in-flight tasks safely. | 0 |
+| **TC-ORCH-12** | Source Post-Tasks Merge & Skip | `--post-tasks-file` + `--skip-post-tasks` | Merges external source tasks; cleanly skips all tasks when flag passed. | 0 |
+| **TC-ORCH-13** | Teradata DB, Storage & PID Audit | Batch 9007 verified via Python auditor | Asserts `PROCESS_PID` is NOT NULL in `BATCH_RUNS`, rows loaded, storage clean. | 0 |
+
+> [!TIP]
+> The automated Unix test suite in [`DATA_LOADER/TESTS/`](../../TESTS/README.md) validates all these scenarios end-to-end on Teradata Vantage with 100% automated pass verification (`./run_all_tests.sh`).
 
 ---
 
