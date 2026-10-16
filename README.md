@@ -56,9 +56,10 @@ Comprehensive operational, technical, and testing manuals are available in the [
 - **Source-Aware Multi-Entity Mapping**: Supports multiple independent upstream sources (e.g., `ORACLE_FUSION`) feeding target staging tables with strict source isolation and inner extension awareness (`.csv` vs `.pecsv`).
 - **Multi-Chunk Asymmetry Handling**: Detects multi-part CSV extracts, normalizes headers on-the-fly (`SkipRows=0` after chunk 1 strip), and loads split extracts in a single high-speed wildcard TPT pass.
 - **Enterprise Auto-Healing**: Intercepts Teradata Error 2652 (`Table is locked for FastLoad / MultiLoad`), executes automated table unlocking via `unlock_tpt_table.sh`, and retries without manual intervention.
+- **Single-Flight Concurrency & Active Polling**: Manages `.orchestrator.pid` in `LOADING_ZONE`; actively polls on live PIDs until release, avoiding concurrent job collision.
 - **Cryptographic & Boundary Validation**: Validates MD5 manifest checksums and enforces strict boundary guards against unmanifested orphan files (OPS-01).
-- **Audit State Machine**: Centralizes real-time batch and task tracking directly in Teradata technical tables (`BATCH_RUNS`, `BATCH_TASKS`).
-- **Downstream Hooks**: Executes chained transformations (`dbt`, shell scripts) only after 100% of tasks succeed.
+- **Permanent Audit State Machine**: Centralizes real-time batch and task tracking directly in Teradata technical tables (`BATCH_RUNS`, `BATCH_TASKS`). Permanently retains `PROCESS_PID` upon completion for historical lineage.
+- **Downstream Hooks & Hybrid Decoupling**: Merges source-specific tasks (`--post-tasks-file`) with global tasks (`post_ingestion_tasks`); bypasses execution cleanly when `--skip-post-tasks` is specified.
 
 ---
 
@@ -188,9 +189,19 @@ ORACLE_FUSION,ERP_MSH_USER_AK,userpvo,".pecsv,.zip,.gz,.pecsv.gz",.pecsv
 
 ## Execution & CLI Usage
 
-Launch the orchestrator directly or via BICC Intake Controller:
+### Standard Orchestrator Run
 ```bash
 python3 orchestrator.py --config config.json
+```
+
+### Ingestion with Post-Tasks Skipped
+```bash
+python3 orchestrator.py --config config.json --skip-post-tasks
+```
+
+### Source-Specific / Delegated Ingestion
+```bash
+python3 orchestrator.py --config config.json --source <SOURCE> --post-tasks-file /path/to/post_tasks.json
 ```
 
 If `LANDING_ZONE` is empty, the orchestrator exits cleanly with Return Code `0` (`IDLE`).
