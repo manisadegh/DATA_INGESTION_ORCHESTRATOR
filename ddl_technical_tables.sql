@@ -12,9 +12,13 @@ CREATE MULTISET TABLE <TECH_DB>.BATCH_RUNS (
     RUN_DATE            DATE FORMAT 'YYYY-MM-DD' NOT NULL,
     START_TIME          TIMESTAMP(0) NOT NULL,
     END_TIME            TIMESTAMP(0),
-    STATUS              VARCHAR(30)  NOT NULL
+    STATUS              VARCHAR(30)  NOT NULL,
+    PROCESS_PID         INTEGER
 )
 UNIQUE PRIMARY INDEX (BATCH_ID);
+
+-- Migration statement for existing environments:
+-- ALTER TABLE <TECH_DB>.BATCH_RUNS ADD PROCESS_PID INTEGER;
 
 -- 2. BATCH_TASKS Table
 -- Tracks the granular status of each individual file/entity within a batch
