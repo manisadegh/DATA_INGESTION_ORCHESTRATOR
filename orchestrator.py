@@ -6,8 +6,35 @@ import shutil
 import argparse
 import gzip
 import zipfile
+import atexit
+import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def is_pid_alive(pid: int) -> bool:
+    """Checks if a given process ID is actively running."""
+    if pid <= 0:
+        return False
+    if os.name == 'nt':
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            SYNCHRONIZE = 0x00100000
+            process = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+            if process != 0:
+                kernel32.CloseHandle(process)
+                return True
+            return False
+        except Exception:
+            return False
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+        except PermissionError:
+            return True
 
 from lib.logger import setup_logger, add_batch_file_logger
 from lib.db_state import TeradataStateDB
@@ -155,6 +182,8 @@ def main():
     
     parser = argparse.ArgumentParser(description="Generic Data Ingestion Orchestrator - Single Batch Architecture")
     parser.add_argument("--config", type=str, required=True, help="Path to configuration file")
+    parser.add_argument("--skip-post-tasks", action="store_true", default=False, help="Skip execution of downstream post-ingestion tasks (e.g. dbt)")
+    parser.add_argument("--source", type=str, default=None, help="Explicit data source override")
     args = parser.parse_args()
 
     # 2. Load Configuration
@@ -181,6 +210,18 @@ def main():
     if not landing_zone:
         logger.critical("Configuration error: 'landing_zone' is required.")
         sys.exit(1)
+
+    # Multi-Source Directory Partitioning Override
+    if args.source:
+        src_landing = os.path.join(landing_zone, args.source)
+        if os.path.isdir(src_landing):
+            landing_zone = src_landing
+        src_loading = os.path.join(loading_zone, args.source)
+        if os.path.isdir(src_loading):
+            loading_zone = src_loading
+        src_archive = os.path.join(archive_zone, args.source)
+        if os.path.isdir(src_archive):
+            archive_zone = src_archive
 
     for key in ['wrapper_script', 'unlock_script']:
         if tpt_config.get(key) and not os.path.isabs(tpt_config[key]):
@@ -210,6 +251,52 @@ def main():
     tpt_config['tpt_env'] = tpt_env
 
     manifest_pattern = orch_config.get('manifest_pattern', 'MANIFEST_*.MF')
+
+    # 2.5 Active Concurrency Guard & Process Lock Management
+    os.makedirs(loading_zone, exist_ok=True)
+    pid_file = os.path.join(loading_zone, ".orchestrator.pid")
+    concurrency_cfg = orch_config.get("concurrency", {})
+    poll_interval = concurrency_cfg.get("poll_interval_seconds", 5)
+    lock_timeout = concurrency_cfg.get("lock_timeout_seconds", 7200)
+
+    if os.path.exists(pid_file):
+        try:
+            with open(pid_file, "r") as pf:
+                active_pid = int(pf.read().strip())
+        except Exception:
+            active_pid = -1
+        if is_pid_alive(active_pid) and active_pid != os.getpid():
+            logger.info(f"Another Orchestrator run is actively in progress (PID {active_pid}). Entering active waiting loop (polling every {poll_interval}s, timeout: {lock_timeout}s)...")
+            start_wait = time.time()
+            while is_pid_alive(active_pid):
+                if time.time() - start_wait > lock_timeout:
+                    logger.critical(f"FATAL: Timeout ({lock_timeout}s) exceeded waiting for active Orchestrator (PID {active_pid}).")
+                    sys.exit(1)
+                time.sleep(poll_interval)
+                logger.info(f"Orchestrator PID {active_pid} still running. Waiting {poll_interval}s...")
+            logger.info(f"Previous Orchestrator (PID {active_pid}) has completed.")
+        if os.path.exists(pid_file):
+            try:
+                os.remove(pid_file)
+            except Exception:
+                pass
+
+    try:
+        with open(pid_file, "w") as pf:
+            pf.write(str(os.getpid()))
+    except Exception as e:
+        logger.warning(f"Could not write PID lock file {pid_file}: {e}")
+
+    def cleanup_pid():
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file, "r") as pf:
+                    stored_pid = int(pf.read().strip())
+                if stored_pid == os.getpid():
+                    os.remove(pid_file)
+            except Exception:
+                pass
+    atexit.register(cleanup_pid)
 
     # 3. Check for In-Flight Batch in LOADING_ZONE (Crash Recovery)
     in_flight_manifests = [
@@ -342,7 +429,11 @@ def main():
         os.environ['CURRENT_SOURCE'] = str(source)
         os.environ['CURRENT_MANIFEST'] = os.path.join(loading_zone, manifest_basename)
         
-        post_success = run_post_tasks(post_tasks) if post_tasks else True
+        if args.skip_post_tasks:
+            logger.info("[INFO] Ingestion completed with 100% success. Post-tasks execution skipped via --skip-post-tasks flag.")
+            post_success = True
+        else:
+            post_success = run_post_tasks(post_tasks) if post_tasks else True
         if post_success:
             # Move files to ARCHIVE_ZONE
             os.makedirs(archive_zone, exist_ok=True)

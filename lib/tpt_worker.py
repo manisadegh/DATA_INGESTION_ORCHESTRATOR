@@ -61,6 +61,10 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
     if extract_timestamp:
         cmd.extend(["-T", str(extract_timestamp)])
     
+    delimiter = tpt_config.get('delimiter') or orch_config.get('delimiter')
+    if delimiter:
+        cmd.extend(["-s", str(delimiter)])
+    
     if target_db and work_db:
         cmd.extend([
             "-d", target_db,

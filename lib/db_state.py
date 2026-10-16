@@ -169,3 +169,41 @@ class TeradataStateDB:
                     SET STATUS = ?, END_TIME = ? 
                     WHERE BATCH_ID = ?
                 """, (final_status, ts_now, batch_id))
+
+    def get_active_batch_run(self, source=None):
+        """Returns active batch dict if any batch has STATUS = 'RUNNING'."""
+        with self.get_connection() as con:
+            with con.cursor() as cur:
+                if source:
+                    cur.execute(f"""
+                        SELECT BATCH_ID, SOURCE, EXTRACT_TIMESTAMP, START_TIME 
+                        FROM {self.tech_db}.BATCH_RUNS 
+                        WHERE STATUS = 'RUNNING' AND SOURCE = ?
+                    """, (source,))
+                else:
+                    cur.execute(f"""
+                        SELECT BATCH_ID, SOURCE, EXTRACT_TIMESTAMP, START_TIME 
+                        FROM {self.tech_db}.BATCH_RUNS 
+                        WHERE STATUS = 'RUNNING'
+                    """)
+                row = cur.fetchone()
+                if row:
+                    return {
+                        "batch_id": row[0],
+                        "source": row[1],
+                        "extract_timestamp": row[2],
+                        "start_time": row[3]
+                    }
+                return None
+
+    def mark_batch_failed(self, batch_id):
+        """Marks an active or abandoned batch as FAILED."""
+        ts_now = current_timestamp_str()
+        with self.get_connection() as con:
+            with con.cursor() as cur:
+                cur.execute(f"""
+                    UPDATE {self.tech_db}.BATCH_RUNS 
+                    SET STATUS = 'FAILED', END_TIME = ? 
+                    WHERE BATCH_ID = ? AND STATUS = 'RUNNING'
+                """, (ts_now, batch_id))
+
