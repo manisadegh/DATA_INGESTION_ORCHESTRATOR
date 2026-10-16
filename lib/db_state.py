@@ -215,32 +215,18 @@ class TeradataStateDB:
         ts_now = current_timestamp_str()
         with self.get_connection() as con:
             with con.cursor() as cur:
-                try:
-                    if source:
-                        cur.execute(f"""
-                            UPDATE {self.tech_db}.BATCH_RUNS 
-                            SET STATUS = ?, END_TIME = ?, PROCESS_PID = NULL 
-                            WHERE BATCH_ID = ? AND SOURCE = ?
-                        """, (final_status, ts_now, batch_id, source))
-                    else:
-                        cur.execute(f"""
-                            UPDATE {self.tech_db}.BATCH_RUNS 
-                            SET STATUS = ?, END_TIME = ?, PROCESS_PID = NULL 
-                            WHERE BATCH_ID = ?
-                        """, (final_status, ts_now, batch_id))
-                except Exception:
-                    if source:
-                        cur.execute(f"""
-                            UPDATE {self.tech_db}.BATCH_RUNS 
-                            SET STATUS = ?, END_TIME = ? 
-                            WHERE BATCH_ID = ? AND SOURCE = ?
-                        """, (final_status, ts_now, batch_id, source))
-                    else:
-                        cur.execute(f"""
-                            UPDATE {self.tech_db}.BATCH_RUNS 
-                            SET STATUS = ?, END_TIME = ? 
-                            WHERE BATCH_ID = ?
-                        """, (final_status, ts_now, batch_id))
+                if source:
+                    cur.execute(f"""
+                        UPDATE {self.tech_db}.BATCH_RUNS 
+                        SET STATUS = ?, END_TIME = ? 
+                        WHERE BATCH_ID = ? AND SOURCE = ?
+                    """, (final_status, ts_now, batch_id, source))
+                else:
+                    cur.execute(f"""
+                        UPDATE {self.tech_db}.BATCH_RUNS 
+                        SET STATUS = ?, END_TIME = ? 
+                        WHERE BATCH_ID = ?
+                    """, (final_status, ts_now, batch_id))
 
     def get_active_batch_run(self, source=None):
         """Returns active batch dict (including PROCESS_PID) if any batch has STATUS = 'RUNNING'."""
@@ -295,34 +281,20 @@ class TeradataStateDB:
                     return None
 
     def mark_batch_failed(self, batch_id, source=None):
-        """Marks an active or abandoned batch as FAILED and clears PROCESS_PID."""
+        """Marks an active or abandoned batch as FAILED."""
         ts_now = current_timestamp_str()
         with self.get_connection() as con:
             with con.cursor() as cur:
-                try:
-                    if source:
-                        cur.execute(f"""
-                            UPDATE {self.tech_db}.BATCH_RUNS 
-                            SET STATUS = 'FAILED', END_TIME = ?, PROCESS_PID = NULL 
-                            WHERE BATCH_ID = ? AND SOURCE = ? AND STATUS = 'RUNNING'
-                        """, (ts_now, batch_id, source))
-                    else:
-                        cur.execute(f"""
-                            UPDATE {self.tech_db}.BATCH_RUNS 
-                            SET STATUS = 'FAILED', END_TIME = ?, PROCESS_PID = NULL 
-                            WHERE BATCH_ID = ? AND STATUS = 'RUNNING'
-                        """, (ts_now, batch_id))
-                except Exception:
-                    if source:
-                        cur.execute(f"""
-                            UPDATE {self.tech_db}.BATCH_RUNS 
-                            SET STATUS = 'FAILED', END_TIME = ? 
-                            WHERE BATCH_ID = ? AND SOURCE = ? AND STATUS = 'RUNNING'
-                        """, (ts_now, batch_id, source))
-                    else:
-                        cur.execute(f"""
-                            UPDATE {self.tech_db}.BATCH_RUNS 
-                            SET STATUS = 'FAILED', END_TIME = ? 
-                            WHERE BATCH_ID = ? AND STATUS = 'RUNNING'
-                        """, (ts_now, batch_id))
+                if source:
+                    cur.execute(f"""
+                        UPDATE {self.tech_db}.BATCH_RUNS 
+                        SET STATUS = 'FAILED', END_TIME = ? 
+                        WHERE BATCH_ID = ? AND SOURCE = ? AND STATUS = 'RUNNING'
+                    """, (ts_now, batch_id, source))
+                else:
+                    cur.execute(f"""
+                        UPDATE {self.tech_db}.BATCH_RUNS 
+                        SET STATUS = 'FAILED', END_TIME = ? 
+                        WHERE BATCH_ID = ? AND STATUS = 'RUNNING'
+                    """, (ts_now, batch_id))
 

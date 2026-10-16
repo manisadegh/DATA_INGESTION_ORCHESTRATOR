@@ -184,6 +184,7 @@ def main():
     parser.add_argument("--config", type=str, required=True, help="Path to configuration file")
     parser.add_argument("--skip-post-tasks", action="store_true", default=False, help="Skip execution of downstream post-ingestion tasks (e.g. dbt)")
     parser.add_argument("--source", type=str, default=None, help="Explicit data source override")
+    parser.add_argument("--post-tasks-file", type=str, default=None, help="Path to JSON file containing source-specific post-ingestion tasks")
     args = parser.parse_args()
 
     # 2. Load Configuration
@@ -447,7 +448,30 @@ def main():
         logger.info(f"[SUCCESS] All {expected_total_files} file tasks for batch {batch_id} ingested successfully.")
         
         # Execute post-tasks
-        post_tasks = orch_config.get('post_ingestion_tasks', [])
+        post_tasks = []
+        
+        # 1. Source-specific tasks passed from Intake Controller via --post-tasks-file
+        if args.post_tasks_file and os.path.exists(args.post_tasks_file):
+            try:
+                with open(args.post_tasks_file, "r", encoding="utf-8") as ptf:
+                    pt_data = expand_env_vars(json.load(ptf))
+                    if isinstance(pt_data, list):
+                        post_tasks.extend(pt_data)
+                    elif isinstance(pt_data, dict):
+                        src_specific = pt_data.get(source, pt_data.get("default", []))
+                        post_tasks.extend(src_specific)
+                logger.info(f"Loaded {len(post_tasks)} source-specific post-task(s) from intake controller ({args.post_tasks_file}).")
+            except Exception as e:
+                logger.warning(f"Could not load post-tasks from file {args.post_tasks_file}: {e}")
+
+        # 2. Tasks configured in Orchestrator config.json (dictionary by source or list)
+        orch_post_tasks = orch_config.get('post_ingestion_tasks', [])
+        if isinstance(orch_post_tasks, dict):
+            src_tasks = orch_post_tasks.get(source, orch_post_tasks.get("default", []))
+            post_tasks.extend(src_tasks)
+        elif isinstance(orch_post_tasks, list):
+            post_tasks.extend(orch_post_tasks)
+
         os.environ['CURRENT_BATCH_ID'] = str(batch_id)
         os.environ['CURRENT_SOURCE'] = str(source)
         os.environ['CURRENT_MANIFEST'] = os.path.join(loading_zone, manifest_basename)
