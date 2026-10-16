@@ -171,14 +171,14 @@ python3 orchestrator.py --config config.json
 
 ## 5. Monitoring & Operational Inspection
 
-### 5.1 Batch Log Naming Convention
-Every run generates a dedicated, batch-specific log file:
+### 5.1 Batch Log Capsule Naming Convention
+Every run generates a dedicated, batch-specific log file inside the batch log capsule:
 ```
-../../LOGS/orchestrator_<SOURCE>_<EXTRACT_TS>_<BATCH_ID>_<RUN_TS>.log
+../../LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/LOG_ORCHESTRATOR_<SOURCE>_<EXTRACT_TS>_<BATCH_ID>_<EXEC_TS>.log
 ```
 Example:
 ```
-orchestrator_ORACLE_FUSION_20261015_120011_000000011_20261015_120921.log
+LOGS/ORACLE_FUSION/2026-10/BATCH_000000011_20261015_120011/LOG_ORCHESTRATOR_ORACLE_FUSION_20261015_120011_000000011_20261015_120921.log
 ```
 
 ### 5.2 Tracking State in Teradata
@@ -208,14 +208,14 @@ ORDER BY START_TIME ASC;
   ```
 - **Root Cause**: A data file exists in `LANDING_ZONE` that is not declared in the manifest.
 - **Resolution**:
-  1. Inspect `LANDING_ZONE` for unmanifested files:
+  1. Inspect `LANDING_ZONE/<SOURCE>/` for unmanifested files:
      ```bash
-     ls -la /sg/local/sid/home/Dsidadm/DATA_LOADER/DATA/LANDING_ZONE/
+     ls -la /sg/local/sid/home/Dsidadm/DATA_LOADER/DATA/LANDING_ZONE/<SOURCE>/
      ```
-  2. If the orphan file belongs to the batch, update the manifest in `DROP_ZONE` and re-run.
+  2. If the orphan file belongs to the batch, update the manifest in `DROP_ZONE/<SOURCE>/` and re-run.
   3. If it is an accidental stray file, quarantine it:
      ```bash
-     mv /sg/local/sid/home/Dsidadm/DATA_LOADER/DATA/LANDING_ZONE/stray_file.csv /tmp/quarantine/
+     mv /sg/local/sid/home/Dsidadm/DATA_LOADER/DATA/LANDING_ZONE/<SOURCE>/stray_file.csv /tmp/quarantine/
      ```
 
 ---
@@ -243,4 +243,4 @@ ORDER BY START_TIME ASC;
 - **Root Cause**: The file was corrupted during transit, or modified after manifest generation.
 - **Resolution**:
   1. The orchestrator halts immediately before executing any TPT jobs or touching the target database.
-  2. Verify source file integrity in `DROP_ZONE/ARCHIVE/` or re-extract from Oracle Fusion BICC.
+  2. Verify source file integrity in the Batch Capsule raw vault (`ARCHIVE_ZONE/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/RAW/`) or re-extract from Oracle Fusion BICC.

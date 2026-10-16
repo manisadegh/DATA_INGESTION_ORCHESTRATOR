@@ -173,8 +173,8 @@ Configured under `post_tasks` in `config.json`. Supports:
 ### 6.3 Archiving to `ARCHIVE_ZONE`
 Upon 100% completion of tasks and post-tasks:
 1. Decompressed temporary files (`.tmp`, `.header_stripped`) are cleaned up.
-2. The manifest and data files are moved from `DATA/LOADING_ZONE` into:
+2. The manifest and payload data files are moved from `DATA/LOADING_ZONE/<SOURCE>/` into the Batch Capsule:
    ```
-   DATA/ARCHIVE_ZONE/
+   DATA/ARCHIVE_ZONE/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/
    ```
-3. `BATCH_RUNS.STATUS` is committed as `SUCCESS`.
+3. `BATCH_RUNS.STATUS` is committed as `SUCCESS`, while retaining `PROCESS_PID` for permanent auditability.

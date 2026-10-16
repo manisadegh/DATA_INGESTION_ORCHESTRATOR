@@ -167,7 +167,7 @@ classDiagram
 
 #### Functions in `lib/logger.py`:
 1. `setup_logger() -> logging.Logger`: Configures base console stream logger.
-2. `add_batch_file_logger(logger, logs_dir, source, extract_timestamp, batch_id) -> Tuple[str, logging.FileHandler]`: Adds dedicated file handler formatted as `orchestrator_<SOURCE>_<TS>_<BATCH_ID>_<RUN_TS>.log`.
+2. `add_batch_file_logger(logs_dir, source, extract_timestamp, batch_id) -> str`: Attaches a dedicated FileHandler inside `LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/LOG_ORCHESTRATOR_<SOURCE>_<EXTRACT_TS>_<BATCH_ID>_<EXEC_TS>.log`.
 
 ---
 
