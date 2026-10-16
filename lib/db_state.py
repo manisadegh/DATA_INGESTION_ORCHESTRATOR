@@ -64,8 +64,8 @@ class TeradataStateDB:
         current_pid = os.getpid()
         with self.get_connection() as con:
             with con.cursor() as cur:
-                # Check if batch exists
-                cur.execute(f"SELECT STATUS FROM {self.tech_db}.BATCH_RUNS WHERE BATCH_ID = ?", (batch_id,))
+                # Check if batch exists for this source
+                cur.execute(f"SELECT STATUS FROM {self.tech_db}.BATCH_RUNS WHERE BATCH_ID = ? AND SOURCE = ?", (batch_id, source))
                 row = cur.fetchone()
 
                 if row is None:
@@ -92,20 +92,20 @@ class TeradataStateDB:
                             VALUES (?, ?, ?, ?, ?, 'PENDING', 0)
                         """, (batch_id, source, extract_timestamp, entity_name, file_name))
                 else:
-                    logger.info(f"Batch {batch_id} already exists with status {row[0]}. Attempting recovery.")
+                    logger.info(f"Batch {batch_id} (Source: {source}) already exists with status {row[0]}. Attempting recovery.")
                     try:
                         cur.execute(f"""
                             UPDATE {self.tech_db}.BATCH_RUNS 
-                            SET STATUS = 'RUNNING', PROCESS_PID = ? WHERE BATCH_ID = ?
-                        """, (current_pid, batch_id))
+                            SET STATUS = 'RUNNING', PROCESS_PID = ? WHERE BATCH_ID = ? AND SOURCE = ?
+                        """, (current_pid, batch_id, source))
                     except Exception:
                         cur.execute(f"""
                             UPDATE {self.tech_db}.BATCH_RUNS 
-                            SET STATUS = 'RUNNING' WHERE BATCH_ID = ?
-                        """, (batch_id,))
+                            SET STATUS = 'RUNNING' WHERE BATCH_ID = ? AND SOURCE = ?
+                        """, (batch_id, source))
                     
                     # For tasks, ensure all current files are recorded
-                    cur.execute(f"SELECT FILE_NAME FROM {self.tech_db}.BATCH_TASKS WHERE BATCH_ID = ?", (batch_id,))
+                    cur.execute(f"SELECT FILE_NAME FROM {self.tech_db}.BATCH_TASKS WHERE BATCH_ID = ? AND SOURCE = ?", (batch_id, source))
                     existing_files = set(r[0] for r in cur.fetchall())
                     for entity_name, file_name in tasks_list:
                         if file_name not in existing_files:
@@ -115,28 +115,47 @@ class TeradataStateDB:
                                 VALUES (?, ?, ?, ?, ?, 'PENDING', 0)
                             """, (batch_id, source, extract_timestamp, entity_name, file_name))
 
-    def get_pending_tasks(self, batch_id):
+    def get_pending_tasks(self, batch_id, source=None):
         """Returns list of (ENTITY_NAME, FILE_NAME, RETRY_COUNT) for PENDING or FAILED tasks."""
         with self.get_connection() as con:
             with con.cursor() as cur:
-                cur.execute(f"""
-                    SELECT ENTITY_NAME, FILE_NAME, RETRY_COUNT 
-                    FROM {self.tech_db}.BATCH_TASKS 
-                    WHERE BATCH_ID = ? AND STATUS IN ('PENDING', 'FAILED')
-                """, (batch_id,))
+                if source:
+                    cur.execute(f"""
+                        SELECT ENTITY_NAME, FILE_NAME, RETRY_COUNT 
+                        FROM {self.tech_db}.BATCH_TASKS 
+                        WHERE BATCH_ID = ? AND SOURCE = ? AND STATUS IN ('PENDING', 'FAILED')
+                    """, (batch_id, source))
+                else:
+                    cur.execute(f"""
+                        SELECT ENTITY_NAME, FILE_NAME, RETRY_COUNT 
+                        FROM {self.tech_db}.BATCH_TASKS 
+                        WHERE BATCH_ID = ? AND STATUS IN ('PENDING', 'FAILED')
+                    """, (batch_id,))
                 return cur.fetchall()
 
-    def update_task_start(self, batch_id, entity_name, file_name=None):
+    def update_task_start(self, batch_id, entity_name, file_name=None, source=None):
         """Updates task status to RUNNING. If file_name is None, updates all files for this entity."""
         ts_now = current_timestamp_str()
         with self.get_connection() as con:
             with con.cursor() as cur:
-                if file_name:
+                if file_name and source:
+                    cur.execute(f"""
+                        UPDATE {self.tech_db}.BATCH_TASKS 
+                        SET STATUS = 'RUNNING', START_TIME = ?, RETRY_COUNT = RETRY_COUNT + 1 
+                        WHERE BATCH_ID = ? AND SOURCE = ? AND ENTITY_NAME = ? AND FILE_NAME = ?
+                    """, (ts_now, batch_id, source, entity_name, file_name))
+                elif file_name:
                     cur.execute(f"""
                         UPDATE {self.tech_db}.BATCH_TASKS 
                         SET STATUS = 'RUNNING', START_TIME = ?, RETRY_COUNT = RETRY_COUNT + 1 
                         WHERE BATCH_ID = ? AND ENTITY_NAME = ? AND FILE_NAME = ?
                     """, (ts_now, batch_id, entity_name, file_name))
+                elif source:
+                    cur.execute(f"""
+                        UPDATE {self.tech_db}.BATCH_TASKS 
+                        SET STATUS = 'RUNNING', START_TIME = ?, RETRY_COUNT = RETRY_COUNT + 1 
+                        WHERE BATCH_ID = ? AND SOURCE = ? AND ENTITY_NAME = ?
+                    """, (ts_now, batch_id, source, entity_name))
                 else:
                     cur.execute(f"""
                         UPDATE {self.tech_db}.BATCH_TASKS 
@@ -144,18 +163,30 @@ class TeradataStateDB:
                         WHERE BATCH_ID = ? AND ENTITY_NAME = ?
                     """, (ts_now, batch_id, entity_name))
 
-    def update_task_end(self, batch_id, entity_name, status, file_name=None, error_msg=""):
+    def update_task_end(self, batch_id, entity_name, status, file_name=None, error_msg="", source=None):
         """Updates task status to SUCCESS or FAILED. If file_name is None, updates all files for this entity."""
         ts_now = current_timestamp_str()
         with self.get_connection() as con:
             with con.cursor() as cur:
                 error_msg = str(error_msg)[:1999] if error_msg else None
-                if file_name:
+                if file_name and source:
+                    cur.execute(f"""
+                        UPDATE {self.tech_db}.BATCH_TASKS 
+                        SET STATUS = ?, END_TIME = ?, ERROR_MESSAGE = ? 
+                        WHERE BATCH_ID = ? AND SOURCE = ? AND ENTITY_NAME = ? AND FILE_NAME = ?
+                    """, (status, ts_now, error_msg, batch_id, source, entity_name, file_name))
+                elif file_name:
                     cur.execute(f"""
                         UPDATE {self.tech_db}.BATCH_TASKS 
                         SET STATUS = ?, END_TIME = ?, ERROR_MESSAGE = ? 
                         WHERE BATCH_ID = ? AND ENTITY_NAME = ? AND FILE_NAME = ?
                     """, (status, ts_now, error_msg, batch_id, entity_name, file_name))
+                elif source:
+                    cur.execute(f"""
+                        UPDATE {self.tech_db}.BATCH_TASKS 
+                        SET STATUS = ?, END_TIME = ?, ERROR_MESSAGE = ? 
+                        WHERE BATCH_ID = ? AND SOURCE = ? AND ENTITY_NAME = ?
+                    """, (status, ts_now, error_msg, batch_id, source, entity_name))
                 else:
                     cur.execute(f"""
                         UPDATE {self.tech_db}.BATCH_TASKS 
@@ -163,33 +194,53 @@ class TeradataStateDB:
                         WHERE BATCH_ID = ? AND ENTITY_NAME = ?
                     """, (status, ts_now, error_msg, batch_id, entity_name))
 
-    def get_batch_summary(self, batch_id, expected_total_files):
+    def get_batch_summary(self, batch_id, expected_total_files, source=None):
         """Returns True if all expected files for this batch are SUCCESS, False otherwise."""
         with self.get_connection() as con:
             with con.cursor() as cur:
-                cur.execute(f"""
-                    SELECT COUNT(*) FROM {self.tech_db}.BATCH_TASKS 
-                    WHERE BATCH_ID = ? AND STATUS = 'SUCCESS'
-                """, (batch_id,))
+                if source:
+                    cur.execute(f"""
+                        SELECT COUNT(*) FROM {self.tech_db}.BATCH_TASKS 
+                        WHERE BATCH_ID = ? AND SOURCE = ? AND STATUS = 'SUCCESS'
+                    """, (batch_id, source))
+                else:
+                    cur.execute(f"""
+                        SELECT COUNT(*) FROM {self.tech_db}.BATCH_TASKS 
+                        WHERE BATCH_ID = ? AND STATUS = 'SUCCESS'
+                    """, (batch_id,))
                 success_count = cur.fetchone()[0]
                 return success_count == expected_total_files
 
-    def finish_batch(self, batch_id, final_status):
+    def finish_batch(self, batch_id, final_status, source=None):
         ts_now = current_timestamp_str()
         with self.get_connection() as con:
             with con.cursor() as cur:
                 try:
-                    cur.execute(f"""
-                        UPDATE {self.tech_db}.BATCH_RUNS 
-                        SET STATUS = ?, END_TIME = ?, PROCESS_PID = NULL 
-                        WHERE BATCH_ID = ?
-                    """, (final_status, ts_now, batch_id))
+                    if source:
+                        cur.execute(f"""
+                            UPDATE {self.tech_db}.BATCH_RUNS 
+                            SET STATUS = ?, END_TIME = ?, PROCESS_PID = NULL 
+                            WHERE BATCH_ID = ? AND SOURCE = ?
+                        """, (final_status, ts_now, batch_id, source))
+                    else:
+                        cur.execute(f"""
+                            UPDATE {self.tech_db}.BATCH_RUNS 
+                            SET STATUS = ?, END_TIME = ?, PROCESS_PID = NULL 
+                            WHERE BATCH_ID = ?
+                        """, (final_status, ts_now, batch_id))
                 except Exception:
-                    cur.execute(f"""
-                        UPDATE {self.tech_db}.BATCH_RUNS 
-                        SET STATUS = ?, END_TIME = ? 
-                        WHERE BATCH_ID = ?
-                    """, (final_status, ts_now, batch_id))
+                    if source:
+                        cur.execute(f"""
+                            UPDATE {self.tech_db}.BATCH_RUNS 
+                            SET STATUS = ?, END_TIME = ? 
+                            WHERE BATCH_ID = ? AND SOURCE = ?
+                        """, (final_status, ts_now, batch_id, source))
+                    else:
+                        cur.execute(f"""
+                            UPDATE {self.tech_db}.BATCH_RUNS 
+                            SET STATUS = ?, END_TIME = ? 
+                            WHERE BATCH_ID = ?
+                        """, (final_status, ts_now, batch_id))
 
     def get_active_batch_run(self, source=None):
         """Returns active batch dict (including PROCESS_PID) if any batch has STATUS = 'RUNNING'."""
@@ -243,21 +294,35 @@ class TeradataStateDB:
                         }
                     return None
 
-    def mark_batch_failed(self, batch_id):
+    def mark_batch_failed(self, batch_id, source=None):
         """Marks an active or abandoned batch as FAILED and clears PROCESS_PID."""
         ts_now = current_timestamp_str()
         with self.get_connection() as con:
             with con.cursor() as cur:
                 try:
-                    cur.execute(f"""
-                        UPDATE {self.tech_db}.BATCH_RUNS 
-                        SET STATUS = 'FAILED', END_TIME = ?, PROCESS_PID = NULL 
-                        WHERE BATCH_ID = ? AND STATUS = 'RUNNING'
-                    """, (ts_now, batch_id))
+                    if source:
+                        cur.execute(f"""
+                            UPDATE {self.tech_db}.BATCH_RUNS 
+                            SET STATUS = 'FAILED', END_TIME = ?, PROCESS_PID = NULL 
+                            WHERE BATCH_ID = ? AND SOURCE = ? AND STATUS = 'RUNNING'
+                        """, (ts_now, batch_id, source))
+                    else:
+                        cur.execute(f"""
+                            UPDATE {self.tech_db}.BATCH_RUNS 
+                            SET STATUS = 'FAILED', END_TIME = ?, PROCESS_PID = NULL 
+                            WHERE BATCH_ID = ? AND STATUS = 'RUNNING'
+                        """, (ts_now, batch_id))
                 except Exception:
-                    cur.execute(f"""
-                        UPDATE {self.tech_db}.BATCH_RUNS 
-                        SET STATUS = 'FAILED', END_TIME = ? 
-                        WHERE BATCH_ID = ? AND STATUS = 'RUNNING'
-                    """, (ts_now, batch_id))
+                    if source:
+                        cur.execute(f"""
+                            UPDATE {self.tech_db}.BATCH_RUNS 
+                            SET STATUS = 'FAILED', END_TIME = ? 
+                            WHERE BATCH_ID = ? AND SOURCE = ? AND STATUS = 'RUNNING'
+                        """, (ts_now, batch_id, source))
+                    else:
+                        cur.execute(f"""
+                            UPDATE {self.tech_db}.BATCH_RUNS 
+                            SET STATUS = 'FAILED', END_TIME = ? 
+                            WHERE BATCH_ID = ? AND STATUS = 'RUNNING'
+                        """, (ts_now, batch_id))
 

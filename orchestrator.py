@@ -278,7 +278,7 @@ def main():
                 logger.info(f"Active batch {b_id} (PID {db_pid}) has completed.")
             elif db_pid and not is_pid_alive(db_pid):
                 logger.warning(f"Batch {b_id} was marked RUNNING in BATCH_RUNS with dead PID {db_pid}. Reclassifying as FAILED.")
-                td_state_pre.mark_batch_failed(b_id)
+                td_state_pre.mark_batch_failed(b_id, source=active_db_batch.get('source'))
     except Exception as e:
         logger.debug(f"Pre-flight BATCH_RUNS active check skipped or non-blocking: {e}")
 
@@ -418,7 +418,7 @@ def main():
         sys.exit(1)
 
     # 7. Phase 4: High-Performance Concurrent Ingestion by Entity
-    pending_tasks = db.get_pending_tasks(batch_id)
+    pending_tasks = db.get_pending_tasks(batch_id, source=source)
     if not pending_tasks:
         logger.info(f"No pending tasks to execute for batch {batch_id}.")
     else:
@@ -443,7 +443,7 @@ def main():
 
     # 8. Phase 5: Completeness Barrier & Post-Tasks
     expected_total_files = len(validated_files)
-    if db.get_batch_summary(batch_id, expected_total_files):
+    if db.get_batch_summary(batch_id, expected_total_files, source=source):
         logger.info(f"[SUCCESS] All {expected_total_files} file tasks for batch {batch_id} ingested successfully.")
         
         # Execute post-tasks
@@ -483,15 +483,15 @@ def main():
                         except Exception as e:
                             logger.warning(f"Could not remove temporary file {item_path}: {e}")
                     
-            db.finish_batch(batch_id, 'SUCCESS')
+            db.finish_batch(batch_id, 'SUCCESS', source=source)
             logger.info(f"[SUCCESS] Pipeline completed successfully for batch {batch_id}!")
             sys.exit(0)
         else:
-            db.finish_batch(batch_id, 'FAILED')
+            db.finish_batch(batch_id, 'FAILED', source=source)
             logger.error(f"[ERROR] Pipeline failed during post-ingestion tasks for batch {batch_id}.")
             sys.exit(1)
     else:
-        db.finish_batch(batch_id, 'FAILED')
+        db.finish_batch(batch_id, 'FAILED', source=source)
         logger.error(f"[ERROR] Completeness barrier failed for batch {batch_id}. Files retained in '{loading_zone}' for recovery.")
         sys.exit(1)
 
