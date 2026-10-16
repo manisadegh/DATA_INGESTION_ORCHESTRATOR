@@ -61,6 +61,7 @@ class TeradataStateDB:
         run_date = datetime.now().strftime('%Y-%m-%d')
         start_time = current_timestamp_str()
 
+        current_pid = os.getpid()
         with self.get_connection() as con:
             with con.cursor() as cur:
                 # Check if batch exists
@@ -68,13 +69,20 @@ class TeradataStateDB:
                 row = cur.fetchone()
 
                 if row is None:
-                    logger.info(f"Initializing new batch {batch_id} (Source: {source}, ExtractTS: {extract_timestamp})")
-                    # Insert batch run
-                    cur.execute(f"""
-                        INSERT INTO {self.tech_db}.BATCH_RUNS 
-                        (BATCH_ID, SOURCE, EXTRACT_TIMESTAMP, RUN_DATE, START_TIME, STATUS) 
-                        VALUES (?, ?, ?, ?, ?, 'RUNNING')
-                    """, (batch_id, source, extract_timestamp, run_date, start_time))
+                    logger.info(f"Initializing new batch {batch_id} (Source: {source}, ExtractTS: {extract_timestamp}, PID: {current_pid})")
+                    # Insert batch run with PROCESS_PID (with fallback if column missing)
+                    try:
+                        cur.execute(f"""
+                            INSERT INTO {self.tech_db}.BATCH_RUNS 
+                            (BATCH_ID, SOURCE, EXTRACT_TIMESTAMP, RUN_DATE, START_TIME, STATUS, PROCESS_PID) 
+                            VALUES (?, ?, ?, ?, ?, 'RUNNING', ?)
+                        """, (batch_id, source, extract_timestamp, run_date, start_time, current_pid))
+                    except Exception:
+                        cur.execute(f"""
+                            INSERT INTO {self.tech_db}.BATCH_RUNS 
+                            (BATCH_ID, SOURCE, EXTRACT_TIMESTAMP, RUN_DATE, START_TIME, STATUS) 
+                            VALUES (?, ?, ?, ?, ?, 'RUNNING')
+                        """, (batch_id, source, extract_timestamp, run_date, start_time))
 
                     # Insert tasks for each file
                     for entity_name, file_name in tasks_list:
@@ -85,10 +93,16 @@ class TeradataStateDB:
                         """, (batch_id, source, extract_timestamp, entity_name, file_name))
                 else:
                     logger.info(f"Batch {batch_id} already exists with status {row[0]}. Attempting recovery.")
-                    cur.execute(f"""
-                        UPDATE {self.tech_db}.BATCH_RUNS 
-                        SET STATUS = 'RUNNING' WHERE BATCH_ID = ?
-                    """, (batch_id,))
+                    try:
+                        cur.execute(f"""
+                            UPDATE {self.tech_db}.BATCH_RUNS 
+                            SET STATUS = 'RUNNING', PROCESS_PID = ? WHERE BATCH_ID = ?
+                        """, (current_pid, batch_id))
+                    except Exception:
+                        cur.execute(f"""
+                            UPDATE {self.tech_db}.BATCH_RUNS 
+                            SET STATUS = 'RUNNING' WHERE BATCH_ID = ?
+                        """, (batch_id,))
                     
                     # For tasks, ensure all current files are recorded
                     cur.execute(f"SELECT FILE_NAME FROM {self.tech_db}.BATCH_TASKS WHERE BATCH_ID = ?", (batch_id,))
@@ -164,46 +178,86 @@ class TeradataStateDB:
         ts_now = current_timestamp_str()
         with self.get_connection() as con:
             with con.cursor() as cur:
-                cur.execute(f"""
-                    UPDATE {self.tech_db}.BATCH_RUNS 
-                    SET STATUS = ?, END_TIME = ? 
-                    WHERE BATCH_ID = ?
-                """, (final_status, ts_now, batch_id))
+                try:
+                    cur.execute(f"""
+                        UPDATE {self.tech_db}.BATCH_RUNS 
+                        SET STATUS = ?, END_TIME = ?, PROCESS_PID = NULL 
+                        WHERE BATCH_ID = ?
+                    """, (final_status, ts_now, batch_id))
+                except Exception:
+                    cur.execute(f"""
+                        UPDATE {self.tech_db}.BATCH_RUNS 
+                        SET STATUS = ?, END_TIME = ? 
+                        WHERE BATCH_ID = ?
+                    """, (final_status, ts_now, batch_id))
 
     def get_active_batch_run(self, source=None):
-        """Returns active batch dict if any batch has STATUS = 'RUNNING'."""
+        """Returns active batch dict (including PROCESS_PID) if any batch has STATUS = 'RUNNING'."""
         with self.get_connection() as con:
             with con.cursor() as cur:
-                if source:
-                    cur.execute(f"""
-                        SELECT BATCH_ID, SOURCE, EXTRACT_TIMESTAMP, START_TIME 
-                        FROM {self.tech_db}.BATCH_RUNS 
-                        WHERE STATUS = 'RUNNING' AND SOURCE = ?
-                    """, (source,))
-                else:
-                    cur.execute(f"""
-                        SELECT BATCH_ID, SOURCE, EXTRACT_TIMESTAMP, START_TIME 
-                        FROM {self.tech_db}.BATCH_RUNS 
-                        WHERE STATUS = 'RUNNING'
-                    """)
-                row = cur.fetchone()
-                if row:
-                    return {
-                        "batch_id": row[0],
-                        "source": row[1],
-                        "extract_timestamp": row[2],
-                        "start_time": row[3]
-                    }
-                return None
+                try:
+                    if source:
+                        cur.execute(f"""
+                            SELECT BATCH_ID, SOURCE, EXTRACT_TIMESTAMP, START_TIME, PROCESS_PID 
+                            FROM {self.tech_db}.BATCH_RUNS 
+                            WHERE STATUS = 'RUNNING' AND SOURCE = ?
+                        """, (source,))
+                    else:
+                        cur.execute(f"""
+                            SELECT BATCH_ID, SOURCE, EXTRACT_TIMESTAMP, START_TIME, PROCESS_PID 
+                            FROM {self.tech_db}.BATCH_RUNS 
+                            WHERE STATUS = 'RUNNING'
+                        """)
+                    row = cur.fetchone()
+                    if row:
+                        return {
+                            "batch_id": row[0],
+                            "source": row[1],
+                            "extract_timestamp": row[2],
+                            "start_time": row[3],
+                            "process_pid": row[4]
+                        }
+                    return None
+                except Exception:
+                    # Fallback if PROCESS_PID column not yet added to BATCH_RUNS DDL
+                    if source:
+                        cur.execute(f"""
+                            SELECT BATCH_ID, SOURCE, EXTRACT_TIMESTAMP, START_TIME 
+                            FROM {self.tech_db}.BATCH_RUNS 
+                            WHERE STATUS = 'RUNNING' AND SOURCE = ?
+                        """, (source,))
+                    else:
+                        cur.execute(f"""
+                            SELECT BATCH_ID, SOURCE, EXTRACT_TIMESTAMP, START_TIME 
+                            FROM {self.tech_db}.BATCH_RUNS 
+                            WHERE STATUS = 'RUNNING'
+                        """)
+                    row = cur.fetchone()
+                    if row:
+                        return {
+                            "batch_id": row[0],
+                            "source": row[1],
+                            "extract_timestamp": row[2],
+                            "start_time": row[3],
+                            "process_pid": None
+                        }
+                    return None
 
     def mark_batch_failed(self, batch_id):
-        """Marks an active or abandoned batch as FAILED."""
+        """Marks an active or abandoned batch as FAILED and clears PROCESS_PID."""
         ts_now = current_timestamp_str()
         with self.get_connection() as con:
             with con.cursor() as cur:
-                cur.execute(f"""
-                    UPDATE {self.tech_db}.BATCH_RUNS 
-                    SET STATUS = 'FAILED', END_TIME = ? 
-                    WHERE BATCH_ID = ? AND STATUS = 'RUNNING'
-                """, (ts_now, batch_id))
+                try:
+                    cur.execute(f"""
+                        UPDATE {self.tech_db}.BATCH_RUNS 
+                        SET STATUS = 'FAILED', END_TIME = ?, PROCESS_PID = NULL 
+                        WHERE BATCH_ID = ? AND STATUS = 'RUNNING'
+                    """, (ts_now, batch_id))
+                except Exception:
+                    cur.execute(f"""
+                        UPDATE {self.tech_db}.BATCH_RUNS 
+                        SET STATUS = 'FAILED', END_TIME = ? 
+                        WHERE BATCH_ID = ? AND STATUS = 'RUNNING'
+                    """, (ts_now, batch_id))
 

@@ -259,6 +259,29 @@ def main():
     poll_interval = concurrency_cfg.get("poll_interval_seconds", 5)
     lock_timeout = concurrency_cfg.get("lock_timeout_seconds", 7200)
 
+    # 2.5.1 Query Teradata BATCH_RUNS for active batch run & PROCESS_PID
+    try:
+        td_state_pre = TeradataStateDB(config.get('teradata', {}))
+        active_db_batch = td_state_pre.get_active_batch_run(source=args.source)
+        if active_db_batch:
+            db_pid = active_db_batch.get('process_pid')
+            b_id = active_db_batch.get('batch_id')
+            if db_pid and is_pid_alive(db_pid) and db_pid != os.getpid():
+                logger.info(f"Active batch {b_id} detected in BATCH_RUNS with running PID {db_pid}. Entering active waiting loop...")
+                start_wait = time.time()
+                while is_pid_alive(db_pid):
+                    if time.time() - start_wait > lock_timeout:
+                        logger.critical(f"FATAL: Timeout ({lock_timeout}s) exceeded waiting for active batch {b_id} (PID {db_pid}).")
+                        sys.exit(1)
+                    time.sleep(poll_interval)
+                    logger.info(f"Batch {b_id} (PID {db_pid}) still active in BATCH_RUNS. Waiting {poll_interval}s...")
+                logger.info(f"Active batch {b_id} (PID {db_pid}) has completed.")
+            elif db_pid and not is_pid_alive(db_pid):
+                logger.warning(f"Batch {b_id} was marked RUNNING in BATCH_RUNS with dead PID {db_pid}. Reclassifying as FAILED.")
+                td_state_pre.mark_batch_failed(b_id)
+    except Exception as e:
+        logger.debug(f"Pre-flight BATCH_RUNS active check skipped or non-blocking: {e}")
+
     if os.path.exists(pid_file):
         try:
             with open(pid_file, "r") as pf:
