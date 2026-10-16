@@ -150,7 +150,8 @@ The orchestrator configuration uses portable relative paths and environment vari
     "timeout_seconds": 3600,
     "target_db": "${TDENV}SIDFINSTG",
     "work_db": "${TDENV}SIDFINWRK",
-    "default_load_mode": "replace"
+    "default_load_mode": "replace",
+    "work_dir": "../../LOGS/tpt_work"
   },
   "orchestration": {
     "landing_zone": "../../DATA/LANDING_ZONE",

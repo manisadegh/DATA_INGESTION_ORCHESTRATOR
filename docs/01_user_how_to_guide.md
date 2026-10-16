@@ -121,7 +121,8 @@ python3 orchestrator.py --config config.json
     "error_limit": 1,
     "max_sessions": 8,
     "reader_instances": 1,
-    "load_instances": 1
+    "load_instances": 1,
+    "work_dir": "../../LOGS/tpt_work"
   },
   "teradata": {
     "host": "${TDPID}",
@@ -164,6 +165,7 @@ python3 orchestrator.py --config config.json
 | `work_database` | String | `${TDENV}SIDFINWRK` | Database for TPT utility tables (`LG_`, `ET_`, `UV_`, `WT_`). |
 | `logon_user` | String | `${TDENV}${SID_ADM_USER}` | User credential for TPT execution. |
 | `max_sessions` | Integer | `8` | Maximum Teradata sessions allocated per TPT job. |
+| `work_dir` | String | `../../LOGS/tpt_work` | Dedicated working and log directory passed to TPT via `-w` (stores jobvars, rejected rows, and tbuild output). |
 
 ---
 

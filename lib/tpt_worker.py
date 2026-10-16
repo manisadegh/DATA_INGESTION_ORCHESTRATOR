@@ -33,6 +33,7 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
     timeout_sec = tpt_config.get('timeout_seconds') or orch_config.get('tpt_timeout_seconds', 3600)
     target_db = tpt_config.get('target_db') or orch_config.get('target_db')
     work_db = tpt_config.get('work_db') or orch_config.get('work_db')
+    work_dir = tpt_config.get('work_dir') or orch_config.get('tpt_work_dir')
     
     tpt_env = tpt_config.get('tpt_env') or orch_config.get('tpt_env')
     if tpt_env is None:
@@ -61,6 +62,10 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
     if extract_timestamp:
         cmd.extend(["-T", str(extract_timestamp)])
     
+    if work_dir:
+        os.makedirs(work_dir, exist_ok=True)
+        cmd.extend(["-w", str(work_dir)])
+
     delimiter = tpt_config.get('delimiter') or orch_config.get('delimiter')
     if delimiter:
         cmd.extend(["-s", str(delimiter)])
@@ -82,6 +87,8 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
                 "-d", target_db,
                 "-k", work_db
             ])
+        if work_dir:
+            unlock_cmd.extend(["-w", str(work_dir)])
         if tpt_env and 'USER' in tpt_env:
             unlock_cmd.extend(["-u", tpt_env['USER']])
     

@@ -224,9 +224,13 @@ def main():
         if os.path.isdir(src_archive):
             archive_zone = src_archive
 
-    for key in ['wrapper_script', 'unlock_script']:
+    for key in ['wrapper_script', 'unlock_script', 'work_dir']:
         if tpt_config.get(key) and not os.path.isabs(tpt_config[key]):
             tpt_config[key] = os.path.normpath(os.path.join(base_dir, tpt_config[key]))
+
+    for key in ['tpt_work_dir']:
+        if orch_config.get(key) and not os.path.isabs(orch_config[key]):
+            orch_config[key] = os.path.normpath(os.path.join(base_dir, orch_config[key]))
 
     mapping_file = orch_config.get('entity_mapping_file', 'entity_mapping.csv')
     if not os.path.isabs(mapping_file):

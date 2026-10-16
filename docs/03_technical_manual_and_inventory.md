@@ -146,7 +146,7 @@ classDiagram
    - **Return**: `True` if unlocked successfully; `False` otherwise.
 
 2. `run_tpt_loader(...) -> Tuple[int, bool]`
-   - **Description**: Assembles CLI command for `load_csv_generic.sh`, sets up environment variables, and launches subprocess. Decodes output using `errors='replace'`. If Error 2652 is encountered, invokes reactive unlock and retries. Updates `BATCH_TASKS` in Teradata.
+   - **Description**: Assembles CLI command for `load_csv_generic.sh`, forwards configured `-w <work_dir>`, sets up environment variables, and launches subprocess. Decodes output using `errors='replace'`. If Error 2652 is encountered, invokes reactive unlock (also targeted to `<work_dir>`) and retries. Updates `BATCH_TASKS` in Teradata.
    - **Return**: `(return_code: int, success: bool)`.
 
 ---
