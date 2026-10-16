@@ -214,18 +214,21 @@ def main():
 
     # Multi-Source Directory Partitioning Override
     if args.source:
-        src_landing = os.path.join(landing_zone, args.source)
-        if os.path.isdir(src_landing):
-            landing_zone = src_landing
-        src_loading = os.path.join(loading_zone, args.source)
-        if os.path.isdir(src_loading):
-            loading_zone = src_loading
-        src_archive = os.path.join(archive_zone, args.source)
-        if os.path.isdir(src_archive):
-            archive_zone = src_archive
-        src_logs = os.path.join(logs_dir, args.source)
-        os.makedirs(src_logs, exist_ok=True)
-        logs_dir = src_logs
+        if os.path.basename(landing_zone).lower() != args.source.lower():
+            landing_zone = os.path.join(landing_zone, args.source)
+        if os.path.basename(loading_zone).lower() != args.source.lower():
+            loading_zone = os.path.join(loading_zone, args.source)
+        if os.path.basename(archive_zone).lower() != args.source.lower():
+            archive_zone = os.path.join(archive_zone, args.source)
+        if os.path.basename(logs_dir).lower() != args.source.lower():
+            logs_dir = os.path.join(logs_dir, args.source)
+        os.makedirs(landing_zone, exist_ok=True)
+        os.makedirs(loading_zone, exist_ok=True)
+        os.makedirs(archive_zone, exist_ok=True)
+        os.makedirs(logs_dir, exist_ok=True)
+        orch_config['landing_zone'] = landing_zone
+        orch_config['loading_zone'] = loading_zone
+        orch_config['archive_zone'] = archive_zone
         orch_config['logs_dir'] = logs_dir
 
     for key in ['wrapper_script', 'unlock_script', 'work_dir']:
@@ -340,6 +343,25 @@ def main():
         if f.endswith('.MF')
     ] if os.path.exists(loading_zone) else []
 
+    # Fallback to parent LOADING_ZONE if placed before partitioning
+    if not in_flight_manifests and args.source:
+        parent_lz = os.path.dirname(loading_zone)
+        if os.path.exists(parent_lz):
+            parent_mfs = [
+                os.path.join(parent_lz, f)
+                for f in os.listdir(parent_lz)
+                if f.endswith('.MF') and (not args.source or args.source.lower() in f.lower())
+            ]
+            if len(parent_mfs) == 1:
+                p_mf = parent_mfs[0]
+                p_mf_name = os.path.basename(p_mf)
+                shutil.move(p_mf, os.path.join(loading_zone, p_mf_name))
+                for f in os.listdir(parent_lz):
+                    f_path = os.path.join(parent_lz, f)
+                    if os.path.isfile(f_path):
+                        shutil.move(f_path, os.path.join(loading_zone, f))
+                in_flight_manifests = [os.path.join(loading_zone, p_mf_name)]
+
     if in_flight_manifests:
         logger.info(f"In-flight batch detected in LOADING_ZONE: {in_flight_manifests[0]}. Resuming execution.")
         manifest_path = in_flight_manifests[0]
@@ -349,6 +371,20 @@ def main():
         active_zone = landing_zone
         is_in_flight = False
         scan_status, manifest_path, data_files = scan_landing_zone(landing_zone, manifest_pattern)
+
+        # Fallback check on parent landing_zone if empty in partition
+        if scan_status == "IDLE" and args.source:
+            parent_landing = os.path.dirname(landing_zone)
+            if os.path.exists(parent_landing):
+                p_status, p_mf, p_files = scan_landing_zone(parent_landing, manifest_pattern)
+                if p_status == "VALID" and (not args.source or args.source.lower() in p_mf.lower()):
+                    p_mf_name = os.path.basename(p_mf)
+                    shutil.move(p_mf, os.path.join(landing_zone, p_mf_name))
+                    for f in p_files:
+                        src_f = os.path.join(parent_landing, f)
+                        if os.path.isfile(src_f):
+                            shutil.move(src_f, os.path.join(landing_zone, f))
+                    scan_status, manifest_path, data_files = scan_landing_zone(landing_zone, manifest_pattern)
         
         if scan_status == "IDLE":
             logger.info("Landing zone is empty. Exiting gracefully with RC 0.")
@@ -487,6 +523,12 @@ def main():
                         src_specific = pt_data.get(source, pt_data.get("default", []))
                         post_tasks.extend(src_specific)
                 logger.info(f"Loaded {len(post_tasks)} source-specific post-task(s) from intake controller ({args.post_tasks_file}).")
+                try:
+                    capsule_pt = os.path.join(batch_log_dir, os.path.basename(args.post_tasks_file))
+                    if os.path.abspath(args.post_tasks_file) != os.path.abspath(capsule_pt):
+                        shutil.copy2(args.post_tasks_file, capsule_pt)
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning(f"Could not load post-tasks from file {args.post_tasks_file}: {e}")
 
