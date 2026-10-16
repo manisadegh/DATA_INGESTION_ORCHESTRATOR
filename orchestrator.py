@@ -223,6 +223,10 @@ def main():
         src_archive = os.path.join(archive_zone, args.source)
         if os.path.isdir(src_archive):
             archive_zone = src_archive
+        src_logs = os.path.join(logs_dir, args.source)
+        os.makedirs(src_logs, exist_ok=True)
+        logs_dir = src_logs
+        orch_config['logs_dir'] = logs_dir
 
     for key in ['wrapper_script', 'unlock_script', 'work_dir']:
         if tpt_config.get(key) and not os.path.isabs(tpt_config[key]):
@@ -231,6 +235,9 @@ def main():
     for key in ['tpt_work_dir']:
         if orch_config.get(key) and not os.path.isabs(orch_config[key]):
             orch_config[key] = os.path.normpath(os.path.join(base_dir, orch_config[key]))
+
+    if args.source and tpt_config.get('work_dir'):
+        tpt_config['work_dir'] = os.path.join(tpt_config['work_dir'], args.source)
 
     mapping_file = orch_config.get('entity_mapping_file', 'entity_mapping.csv')
     if not os.path.isabs(mapping_file):

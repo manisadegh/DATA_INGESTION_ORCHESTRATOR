@@ -58,8 +58,8 @@ Comprehensive operational, technical, and testing manuals are available in the [
 - **Enterprise Auto-Healing**: Intercepts Teradata Error 2652 (`Table is locked for FastLoad / MultiLoad`), executes automated table unlocking via `unlock_tpt_table.sh`, and retries without manual intervention.
 - **Single-Flight Concurrency & Active Polling**: Manages `.orchestrator.pid` in `LOADING_ZONE`; actively polls on live PIDs until release, avoiding concurrent job collision.
 - **Cryptographic & Boundary Validation**: Validates MD5 manifest checksums and enforces strict boundary guards against unmanifested orphan files (OPS-01).
-- **Permanent Audit State Machine**: Centralizes real-time batch and task tracking directly in Teradata technical tables (`BATCH_RUNS`, `BATCH_TASKS`). Permanently retains `PROCESS_PID` upon completion for historical lineage.
 - **Downstream Hooks & Hybrid Decoupling**: Merges source-specific tasks (`--post-tasks-file`) with global tasks (`post_ingestion_tasks`); bypasses execution cleanly when `--skip-post-tasks` is specified.
+- **Multi-Source Directory & Log Partitioning**: Dynamically partitions landing, loading, archive zones, and logs (`LOGS/<source>/`) when running with `--source <SOURCE>`, avoiding inter-source cross-talk.
 
 ---
 

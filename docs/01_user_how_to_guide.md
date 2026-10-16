@@ -148,7 +148,7 @@ python3 orchestrator.py --config config.json
 | `landing_zone` | String | `../../DATA/LANDING_ZONE` | Single-batch ingress gate. |
 | `loading_zone` | String | `../../DATA/LOADING_ZONE` | Private staging directory where decompression and header stripping occur. |
 | `archive_zone` | String | `../../DATA/ARCHIVE_ZONE` | Final resting place for completed batches. |
-| `logs_dir` | String | `../../LOGS` | Log directory. |
+| `logs_dir` | String | `../../LOGS` | Log directory (dynamically partitioned into `LOGS/<SOURCE>/` when running with `--source`). |
 | `entity_mapping_file` | String | `../../CONFIG/entity_mapping.csv` | File routing CSV mapping file signatures to target staging tables. |
 | `max_concurrent_entities` | Integer | `4` | Number of worker threads executing TPT in parallel. |
 | `max_retries_per_entity` | Integer | `1` | Automatic retry attempts per failed entity before marking batch failed. |

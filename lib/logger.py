@@ -20,8 +20,11 @@ def add_batch_file_logger(logs_dir, source, extract_timestamp, batch_id):
     Attaches a dedicated run-specific FileHandler in logs_dir.
     Naming: LOGS/orchestrator_<SOURCE>_<EXTRACT_TIMESTAMP>_<BATCH_ID>_<EXECUTION_TS>.log
     """
-    logger = logging.getLogger("DATA_INGESTION_ORCHESTRATOR")
-    os.makedirs(logs_dir, exist_ok=True)
+    # Partition logs directory by source if not already done
+    target_dir = logs_dir
+    if source and os.path.basename(logs_dir).lower() != str(source).lower():
+        target_dir = os.path.join(logs_dir, str(source))
+    os.makedirs(target_dir, exist_ok=True)
     
     execution_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     # Clean any special characters from components
@@ -30,7 +33,7 @@ def add_batch_file_logger(logs_dir, source, extract_timestamp, batch_id):
     clean_batch = str(batch_id).replace("/", "_").replace("\\", "_")
     
     log_filename = f"orchestrator_{clean_src}_{clean_ext}_{clean_batch}_{execution_ts}.log"
-    log_filepath = os.path.join(logs_dir, log_filename)
+    log_filepath = os.path.join(target_dir, log_filename)
     
     file_handler = logging.FileHandler(log_filepath, encoding="utf-8")
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
