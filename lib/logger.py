@@ -20,6 +20,7 @@ def add_batch_file_logger(logs_dir, source, extract_timestamp, batch_id):
     Attaches a dedicated run-specific FileHandler in logs_dir.
     Standardized Naming: LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/LOG_ORCHESTRATOR_<SOURCE>_<EXTRACT_TS>_<BATCH_ID>_<EXEC_TS>.log
     """
+    logger = logging.getLogger("DATA_INGESTION_ORCHESTRATOR")
     clean_src = str(source).replace("/", "_").replace("\\", "_")
     clean_ext = str(extract_timestamp).replace(":", "").replace("-", "").replace(" ", "_")
     clean_batch = str(batch_id).replace("/", "_").replace("\\", "_")
