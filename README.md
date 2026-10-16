@@ -59,7 +59,9 @@ Comprehensive operational, technical, and testing manuals are available in the [
 - **Single-Flight Concurrency & Active Polling**: Manages `.orchestrator.pid` in `LOADING_ZONE`; actively polls on live PIDs until release, avoiding concurrent job collision.
 - **Cryptographic & Boundary Validation**: Validates MD5 manifest checksums and enforces strict boundary guards against unmanifested orphan files (OPS-01).
 - **Downstream Hooks & Hybrid Decoupling**: Merges source-specific tasks (`--post-tasks-file`) with global tasks (`post_ingestion_tasks`); bypasses execution cleanly when `--skip-post-tasks` is specified.
-- **Multi-Source Directory & Log Partitioning**: Dynamically partitions landing, loading, archive zones, and logs (`LOGS/<source>/`) when running with `--source <SOURCE>`, avoiding inter-source cross-talk.
+- **Batch Capsule Hierarchy**: Organizes deliverables in `ARCHIVE_ZONE/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/` and logs in `LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/`.
+- **TPT Loader Working Directory Isolation**: Nests TPT job variables and logs inside the batch log capsule (`LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/TPT/`).
+- **Canonical Naming Compliance**: Standardizes log filenames (`LOG_ORCHESTRATOR_<SOURCE>_<EXTRACT_TS>_<BATCH_ID>_<EXEC_TS>.log`) and receipts.
 
 ---
 
@@ -214,6 +216,6 @@ If `LANDING_ZONE` is empty, the orchestrator exits cleanly with Return Code `0` 
 | Exit Code | Meaning | Action |
 | :---: | :--- | :--- |
 | `0` | Batch ingested and archived successfully, or `LANDING_ZONE` is empty (`IDLE`). | Normal operation. |
-| `1` | OPS-01 violation (orphans / multiple manifests), checksum failure, or TPT task error. | Inspect `LOGS/orchestrator_*.log` and Teradata `BATCH_TASKS` table. |
+| `1` | OPS-01 violation (orphans / multiple manifests), checksum failure, or TPT task error. | Inspect `LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/LOG_ORCHESTRATOR_*.log` and Teradata `BATCH_TASKS` table. |
 
 For detailed failure scenarios, error runbooks, and recovery instructions, consult **[docs/01_user_how_to_guide.md](docs/01_user_how_to_guide.md)**.

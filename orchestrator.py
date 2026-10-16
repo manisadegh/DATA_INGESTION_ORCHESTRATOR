@@ -371,8 +371,23 @@ def main():
     extract_ts = manifest_meta['extract_timestamp']
     batch_id = manifest_meta['batch_id']
 
-    # Initialize dedicated run log file in LOGS/
-    run_log_file = add_batch_file_logger(logs_dir, source, extract_ts, batch_id)
+    clean_ts = str(extract_ts).replace(":", "").replace("-", "").replace(" ", "_")
+    year_month = f"{clean_ts[:4]}-{clean_ts[4:6]}" if len(clean_ts) >= 6 else "UNKNOWN_DATE"
+    capsule_folder = f"BATCH_{batch_id}_{clean_ts}"
+
+    # Build Batch Log Capsule directory: LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/
+    if os.path.basename(logs_dir).lower() == str(source).lower():
+        batch_log_dir = os.path.join(logs_dir, year_month, capsule_folder)
+    else:
+        batch_log_dir = os.path.join(logs_dir, str(source), year_month, capsule_folder)
+    os.makedirs(batch_log_dir, exist_ok=True)
+
+    # Nest TPT working directory inside the batch log capsule: .../BATCH_<ID>_<TS>/TPT
+    tpt_config['work_dir'] = os.path.join(batch_log_dir, "TPT")
+    os.makedirs(tpt_config['work_dir'], exist_ok=True)
+
+    # Initialize dedicated run log file in batch_log_dir
+    run_log_file = add_batch_file_logger(batch_log_dir, source, extract_ts, batch_id)
     logger.info(f"Processing Batch {batch_id} (Source: {source}, Extract: {extract_ts}) [In-Flight: {is_in_flight}]")
 
     try:
@@ -493,17 +508,21 @@ def main():
         else:
             post_success = run_post_tasks(post_tasks) if post_tasks else True
         if post_success:
-            # Move files to ARCHIVE_ZONE
-            os.makedirs(archive_zone, exist_ok=True)
-            logger.info(f"Archiving processed files from '{loading_zone}' to '{archive_zone}'...")
+            # Build Batch Capsule directory in ARCHIVE_ZONE: ARCHIVE_ZONE/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/
+            if os.path.basename(archive_zone).lower() == str(source).lower():
+                batch_archive_dir = os.path.join(archive_zone, year_month, capsule_folder)
+            else:
+                batch_archive_dir = os.path.join(archive_zone, str(source), year_month, capsule_folder)
+            os.makedirs(batch_archive_dir, exist_ok=True)
+            logger.info(f"Archiving processed batch files into Batch Capsule: '{batch_archive_dir}'...")
             
-            # Archive manifest
-            shutil.move(os.path.join(loading_zone, manifest_basename), os.path.join(archive_zone, manifest_basename))
+            # Archive standardized manifest into capsule
+            shutil.move(os.path.join(loading_zone, manifest_basename), os.path.join(batch_archive_dir, manifest_basename))
             # Archive data files & clean markers
             for f in validated_files:
                 f_path = os.path.join(loading_zone, f)
                 if os.path.exists(f_path):
-                    shutil.move(f_path, os.path.join(archive_zone, f))
+                    shutil.move(f_path, os.path.join(batch_archive_dir, f))
                 marker_path = os.path.join(loading_zone, "." + f + ".header_stripped")
                 if os.path.exists(marker_path):
                     os.remove(marker_path)
