@@ -1,99 +1,71 @@
-# DATA_INGESTION_ORCHESTRATOR - Technical Manual & Codebase Inventory
+# DATA_INGESTION_ORCHESTRATOR - Technical Manual & Inventory
 
-## 1. Internal Architecture & Component Structure
+## 1. System Context & Component Architecture
 
-The **DATA_INGESTION_ORCHESTRATOR** repository is structured as a modular Python package:
+The **DATA_INGESTION_ORCHESTRATOR** (`orchestrator.py`) is deployed on the Linux application server at:
+```
+/sg/local/sid/home/Dsidadm/DATA_LOADER/PROCESSING_TOOLS/DATA_INGESTION_ORCHESTRATOR/
+```
+It controls the atomic ingress, decompression, header normalization, and parallel ingestion of single batches into Teradata Vantage, interfacing directly with `load_csv_generic.sh` and tracking execution state in technical tables.
 
 ```
 DATA_INGESTION_ORCHESTRATOR/
-├── orchestrator.py               # Master Pipeline Supervisor & Concurrent Executor
-├── config.json                   # Runtime pipeline configuration
-├── config_template.json          # Template configuration
-├── ddl_technical_tables.sql      # Teradata DDL for BATCH_RUNS & BATCH_TASKS
-├── entity_mapping.csv            # Mapping rules for signature-to-table resolution
-└── lib/                          # Specialized library modules
-    ├── sensor.py                 # Landing zone scanner, manifest parsing & gating
-    ├── db_state.py               # Teradata Vantage state machine database interface
-    ├── tpt_worker.py             # Subprocess execution & Error 2652 lock recovery
-    ├── post_tasks.py             # Post-ingestion hooks (shell / dbt)
-    └── logger.py                 # Dual stream & batch-specific file logging
-```
-
-```mermaid
-classDiagram
-    class OrchestratorMain {
-        +strip_header_in_place()
-        +process_entity_task()
-        +expand_env_vars()
-        +main()
-    }
-
-    class Sensor {
-        +DEFAULT_MANIFEST_REGEX
-        +scan_landing_zone()
-        +parse_manifest_metadata()
-        +parse_manifest_content()
-        +compute_checksum()
-        +verify_and_map_batch()
-    }
-
-    class TeradataStateDB {
-        +connect()
-        +initialize_batch_run()
-        +initialize_batch_tasks()
-        +update_batch_status()
-        +update_task_status()
-        +get_pending_tasks()
-        +is_batch_in_flight()
-        +close()
-    }
-
-    class TptWorker {
-        +unlock_table_reactive()
-        +run_tpt_loader()
-    }
-
-    class PostTasks {
-        +run_post_tasks()
-    }
-
-    class LoggerUtil {
-        +setup_logger()
-        +add_batch_file_logger()
-    }
-
-    OrchestratorMain --> Sensor : Validates gating & manifest
-    OrchestratorMain --> TeradataStateDB : Persists BATCH_RUNS & TASKS
-    OrchestratorMain --> TptWorker : Spawns TPT subprocesses
-    OrchestratorMain --> PostTasks : Executes downstream hooks
-    OrchestratorMain --> LoggerUtil : Logs execution streams
+├── orchestrator.py             # Master orchestrator entrypoint & concurrency sentry
+├── config.json                 # Deployment configuration file
+├── config_template.json        # Template configuration with concurrency defaults
+├── entity_mapping.csv          # Entity-to-table signature mapping definitions
+├── ddl_technical_tables.sql    # Teradata DDL for BATCH_RUNS & BATCH_TASKS
+├── docs/                       # Technical and operational documentation suite
+└── lib/
+    ├── sensor.py               # Landing zone discovery, gating & checksum verification
+    ├── db_state.py             # Teradata state persistence (BATCH_RUNS / TASKS)
+    ├── tpt_worker.py           # Subprocess execution & Error 2652 reactive lock recovery
+    ├── post_tasks.py           # Source and global post-task execution engine
+    └── logger.py               # Batch log capsule and execution logging setup
 ```
 
 ---
 
-## 2. Complete Module & Function Inventory
+## 2. Module Inventory & Code Signatures
 
 ### 2.1 Entrypoint: `orchestrator.py`
 - **Path**: `orchestrator.py`
 - **Role**: Master batch ingress controller, concurrency driver, archive manager.
 
 #### Functions in `orchestrator.py`:
-1. `strip_header_in_place(file_path: str) -> None`
-   - **Signature**: `strip_header_in_place(file_path)`
-   - **Description**: Strips line 1 (header) from a delimited text file in-place using a `.tmp` swap file. Writes `.<filename>.header_stripped` marker file to ensure idempotency across retries.
-   - **Side Effects**: Modifies file in-place; creates marker file.
+1. `is_pid_alive(pid: int) -> bool`
+   - **Signature**: `is_pid_alive(pid: int) -> bool`
+   - **Description**: Verifies if an OS Process ID is actively running. On POSIX/Linux, executes `os.kill(pid, 0)` with error trapping for dead processes vs permission boundaries. On Windows NT, uses Win32 `kernel32.OpenProcess`.
+   - **Return**: `True` if process is active; `False` if dead or non-existent.
 
-2. `process_entity_task(entity, entity_info, batch_id, extract_timestamp, tpt_config, orch_config, db) -> bool`
-   - **Signature**: `process_entity_task(...)`
-   - **Description**: ThreadPool worker target. Handles decompression (`.zip`/`.gz`), determines single vs multi-chunk layout, executes `strip_header_in_place` on chunk 1 if needed, invokes `run_tpt_loader()`, and returns task success boolean.
+2. `strip_header_in_place(file_path: str) -> None`
+   - **Signature**: `strip_header_in_place(file_path: str) -> None`
+   - **Description**: Strips line 1 (header) from a delimited text file in-place using a temporary swap file (`.tmp`). Writes a `.<filename>.header_stripped` marker file to guarantee idempotency across task retries.
+   - **Side Effects**: Modifies file in-place; creates hidden marker file.
 
-3. `expand_env_vars(data: Any) -> Any`
-   - **Signature**: `expand_env_vars(data)`
+3. `process_entity_task(entity, entity_info, batch_id, extract_timestamp, tpt_config, orch_config, db) -> bool`
+   - **Signature**: `process_entity_task(entity, entity_info, batch_id, extract_timestamp, tpt_config, orch_config, db) -> bool`
+   - **Description**: ThreadPool worker target. Safely unpacks archives (`.zip` / `.gz`) inside `LOADING_ZONE`, determines single vs multi-chunk structure, applies `strip_header_in_place` on Chunk 1 if multi-chunk delimited text, configures `SkipRows` (0 for normalized multi-chunks, 1 for single files), invokes `run_tpt_loader()`, and returns task success boolean.
+
+4. `expand_env_vars(data: Any) -> Any`
+   - **Signature**: `expand_env_vars(data: Any) -> Any`
    - **Description**: Recursively expands `${VAR}` or `$VAR` environment variables in configuration strings, dictionaries, and lists.
 
-4. `main() -> None`
-   - **Signature**: `main()`
-   - **Description**: Execution entrypoint. Enforces single-batch gating, moves files from `LANDING_ZONE` to `LOADING_ZONE`, registers database state, dispatches tasks to `ThreadPoolExecutor`, evaluates completion barrier, executes post-tasks, moves completed batch to `ARCHIVE_ZONE`, and commits final batch status.
+5. `main() -> None`
+   - **Signature**: `main() -> None`
+   - **Execution Sequence**:
+     1. **Configuration & Paths**: Loads `config.json`, resolves relative paths, applies `--source` partition overrides to `LANDING_ZONE`, `LOADING_ZONE`, `ARCHIVE_ZONE`, and `LOGS`.
+     2. **Teradata Pre-Flight Check**: Queries `BATCH_RUNS` for active batches of this source (`get_active_batch_run(source)`). If active PID is alive, enters active polling wait loop (`poll_interval_seconds: 5`). If PID is dead, reclassifies orphaned batch as `FAILED` (`mark_batch_failed`).
+     3. **Process Lock Sentry**: Inspects `LOADING_ZONE/<SOURCE>/.orchestrator.pid`. If an active PID is alive, polls until completion. Acquires lock and registers `atexit` cleanup.
+     4. **In-Flight Crash Check**: Inspects `LOADING_ZONE/<SOURCE>` for uncompleted `.MF`. If found, activates crash recovery (`is_in_flight = True`), bypassing checksum validation and resuming remaining tasks.
+     5. **Landing Zone Gating**: If no in-flight batch, scans `LANDING_ZONE/<SOURCE>` via `scan_landing_zone()`. Enforces single-batch invariant (OPS-01) and orphan-free integrity.
+     6. **Batch Log Capsule Setup**: Creates `LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/` and sets `tpt_config['work_dir'] = .../TPT/`.
+     7. **Payload Validation & Move**: Validates checksums, maps files to entities (`verify_and_map_batch`), and moves payload files from `LANDING_ZONE` to `LOADING_ZONE`.
+     8. **State Initialization**: Inserts or updates batch in `BATCH_RUNS` (`STATUS = 'RUNNING'`, records `PROCESS_PID`), and registers all entity files in `BATCH_TASKS` as `PENDING`.
+     9. **Parallel Worker Dispatch**: Executes entity tasks in parallel via `ThreadPoolExecutor(max_workers=max_concurrent_jobs)`.
+     10. **Completeness Barrier**: Verifies that 100% of expected entity files succeeded. If any task failed after maximum retries, marks `BATCH_RUNS` as `FAILED` and aborts.
+     11. **Post-Tasks Execution**: Merges source-specific tasks (`--post-tasks-file`) with global tasks and executes them synchronously.
+     12. **Archiving & Final Commit**: Moves data payload and manifest to `ARCHIVE_ZONE/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/`, cleans temporary markers, updates `BATCH_RUNS` to `SUCCESS` (permanently retaining `PROCESS_PID`), and removes `.orchestrator.pid`.
 
 ---
 
@@ -103,19 +75,19 @@ classDiagram
 
 #### Functions in `lib/sensor.py`:
 1. `scan_landing_zone(landing_zone: str, manifest_pattern: str = "MANIFEST_*.MF") -> Tuple[str, Optional[str], List[str]]`
-   - **Description**: Inspects directory contents. Returns status (`'IDLE'`, `'ERROR_MISSING_MANIFEST'`, `'ERROR_MULTIPLE_MANIFESTS'`, `'OK'`), manifest path, and data files list.
+   - **Description**: Inspects directory contents. Returns status (`'IDLE'`, `'ERROR_MISSING_MANIFEST'`, `'ERROR_MULTIPLE_MANIFESTS'`, `'VALID'`), manifest path, and data files list.
 
 2. `parse_manifest_metadata(manifest_path: str, manifest_regex: Optional[str] = None) -> Dict[str, str]`
-   - **Description**: Extracts `source`, `extract_timestamp`, and `batch_id` from filename. Normalizes timestamp to `YYYY-MM-DD HH:MM:SS`.
+   - **Description**: Extracts `source`, `extract_timestamp`, and `batch_id` from manifest filename. Normalizes timestamp to `YYYY-MM-DD HH:MM:SS`.
 
-3. `parse_manifest_content(manifest_path: str) -> List[Dict[str, Optional[str]]]`
-   - **Description**: Reads manifest CSV content. Extracts `filename` and `checksum` pairs. Ignores comments and empty lines.
+3. `parse_manifest_content(manifest_path: str) -> List[Dict[str, str]]`
+   - **Description**: Reads manifest CSV content (`filename,checksum`), skipping empty lines and comments.
 
-4. `compute_checksum(filepath: str, algorithm: str = "auto") -> str`
+4. `compute_file_checksum(file_path: str, algorithm: str = "md5") -> str`
    - **Description**: Reads file in 64 KB blocks and computes cryptographic MD5 or SHA256 checksum.
 
-5. `verify_and_map_batch(landing_zone, manifest_entries, mapping_file, verify_checksum=True, allow_orphan_files=False, source=None) -> Tuple[Dict, List]`
-   - **Description**: Verifies all files exist and are $>0$ bytes, validates checksums, rejects unmanifested orphan files (OPS-01), matches files to target tables via `entity_mapping.csv`, and returns structured workload mapping.
+5. `verify_and_map_batch(...) -> Tuple[Dict[str, Dict], List[str]]`
+   - **Description**: Enforces OPS-01 (orphan guard). Validates declared checksums. Maps declared files to target tables using `entity_mapping.csv`. Returns entity workload dictionary and list of validated files.
 
 ---
 
@@ -124,94 +96,50 @@ classDiagram
 - **Role**: State persistence in Teradata Vantage (`BATCH_RUNS` and `BATCH_TASKS`).
 
 #### Class: `TeradataStateDB`
-- **Methods**:
-  1. `connect() -> None`: Establishes session to Teradata Vantage using `teradatasql`. Supports `$tdwallet`, property files, or environment overrides.
-  2. `initialize_batch_run(batch_id, source, extract_timestamp) -> None`: Inserts or updates a row in `BATCH_RUNS` with `STATUS = 'RUNNING'` and `PROCESS_PID = os.getpid()`. Formats dates strictly to `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` to avoid Teradata Error 5404.
-  3. `initialize_batch_tasks(batch_id, source, extract_timestamp, entities_workload) -> None`: Inserts pending task records into `BATCH_TASKS`.
-  4. `update_batch_status(batch_id, status) -> None`: Commits terminal status (`SUCCESS` or `FAILED`), sets `END_TIME`, and preserves `PROCESS_PID` permanently without overwriting it to `NULL` (maintaining historical auditability).
-  5. `update_task_status(batch_id, entity_name, file_name, status, error_message=None, retry_count=0) -> None`: Updates task record status and retry counters.
-  6. `get_pending_tasks(batch_id) -> List[Tuple]`: Retrieves unfinished entity tasks for in-flight recovery.
-  7. `is_batch_in_flight(batch_id) -> bool`: Checks if a batch was previously started and remains uncompleted.
-  8. `close() -> None`: Safely commits and closes database sessions.
+1. `__init__(td_config: dict)`: Resolves host, user, encrypted password (`Key`/`Pass` files or `TD_PASSWORD`), logmech, and technical database name.
+2. `get_connection() -> teradatasql.TeradataConnection`: Establishes Teradata connection.
+3. `initialize_batch(batch_id, source, extract_timestamp, tasks_list) -> None`: Inserts or updates a row in `BATCH_RUNS` with `STATUS = 'RUNNING'` and `PROCESS_PID = os.getpid()`. Inserts task records in `BATCH_TASKS` as `PENDING`. Formats dates strictly to `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` to avoid Teradata Error 5404.
+4. `get_pending_tasks(batch_id, source=None) -> List[Tuple]`: Returns list of `(ENTITY_NAME, FILE_NAME, RETRY_COUNT)` for `PENDING` or `FAILED` tasks.
+5. `update_task_start(batch_id, entity_name, file_name=None, source=None)`: Commits task status as `RUNNING` with current timestamp.
+6. `update_task_success(batch_id, entity_name, file_name=None, source=None)`: Commits task status as `SUCCESS` with end timestamp.
+7. `update_task_failure(batch_id, entity_name, error_msg, file_name=None, source=None)`: Increments `RETRY_COUNT`, records error message, and sets status to `FAILED`.
+8. `get_batch_summary(batch_id, expected_total_files, source=None) -> bool`: Returns `True` if `COUNT(*) WHERE STATUS = 'SUCCESS'` equals expected files count.
+9. `finish_batch(batch_id, final_status, source=None)`: Updates `BATCH_RUNS` status (`SUCCESS` or `FAILED`) and commits `END_TIME` while permanently preserving `PROCESS_PID`.
+10. `get_active_batch_run(source=None) -> Optional[Dict]`: Queries for any batch with `STATUS = 'RUNNING'` (optionally filtered by source), returning `BATCH_ID`, `SOURCE`, `EXTRACT_TIMESTAMP`, and `PROCESS_PID`.
+11. `mark_batch_failed(batch_id, source=None)`: Auto-heals orphaned batches by setting `STATUS = 'FAILED'`.
 
 ---
 
 ### 2.4 Module: `lib/tpt_worker.py`
 - **Path**: `lib/tpt_worker.py`
-- **Role**: Manages child process execution of `TPT_LOADER/load_csv_generic.sh` and reactive lock recovery.
+- **Role**: Subprocess execution of `load_csv_generic.sh` with auto-healing and pre-emptive table unlocking.
 
 #### Functions in `lib/tpt_worker.py`:
-1. `unlock_table_reactive(entity: str, unlock_script: str, load_mode: str, tpt_config: dict, tpt_env: dict, logger) -> bool`
-   - **Description**: Invoked when TPT fails with Error 2652 (table locked/paused). Executes `unlock_tpt_table.sh -t <entity> -m <load_mode>` to release MultiLoad or resume FastLoad.
-   - **Return**: `True` if unlocked successfully; `False` otherwise.
-
-2. `run_tpt_loader(...) -> Tuple[int, bool]`
-   - **Description**: Assembles CLI command for `load_csv_generic.sh`, forwards configured `-w <work_dir>`, sets up environment variables, and launches subprocess. Decodes output using `errors='replace'`. If Error 2652 is encountered, invokes reactive unlock (also targeted to `<work_dir>`) and retries. Updates `BATCH_TASKS` in Teradata.
-   - **Return**: `(return_code: int, success: bool)`.
+1. `run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, ...) -> Tuple[int, bool]`
+   - **Description**: Dispatches `TPT_LOADER/load_csv_generic.sh`.
+   - **Auto-Healing**:
+     - On retry ($>0$), issues a pre-emptive unlock via `unlock_tpt_table.sh`.
+     - Intercepts return code `3` or output containing Error `2652` (`Table is being Loaded / Paused`), executes reactive unlock, and retries.
+     - Safely replaces non-UTF8 characters in output streams (`errors='replace'`).
 
 ---
 
 ### 2.5 Module: `lib/post_tasks.py`
 - **Path**: `lib/post_tasks.py`
-- **Role**: Executes chained post-ingestion tasks upon 100% batch ingestion success.
+- **Role**: Post-ingestion task execution engine.
 
 #### Functions in `lib/post_tasks.py`:
-1. `run_post_tasks(post_tasks_config: List[Dict], batch_metadata: Dict, logger) -> bool`
-   - **Description**: Iterates through configured post-tasks. Supports task type `"shell"` and `"dbt"`. Merges tasks from Orchestrator `config.json` with source-specific tasks passed via `--post-tasks-file <FILE>`. Substitutes batch placeholders (e.g. `{batch_id}`, `$CURRENT_BATCH_ID`, `{source}`, `{extract_timestamp}`) into commands. Executes via `subprocess.run()`. Returns `True` if all tasks succeed. Bypassed cleanly when `--skip-post-tasks` is specified.
+1. `run_post_tasks(post_tasks_config: list, batch_id: str, source: str, extract_timestamp: str, ...) -> bool`
+   - **Description**: Merges source-specific tasks (loaded from `--post-tasks-file`) with global tasks from `config.json`.
+   - **Variable Injection**: Automatically exports `$CURRENT_BATCH_ID`, `$CURRENT_SOURCE`, and `$CURRENT_EXTRACT_TIMESTAMP` into subprocess environments.
 
 ---
 
-### 2.6 Module: `lib/logger.py`
-- **Path**: `lib/logger.py`
-- **Role**: Centralized and batch-specific logging setup.
+## 3. Exit Codes & Process Termination Matrix
 
-#### Functions in `lib/logger.py`:
-1. `setup_logger() -> logging.Logger`: Configures base console stream logger.
-2. `add_batch_file_logger(logs_dir, source, extract_timestamp, batch_id) -> str`: Attaches a dedicated FileHandler inside `LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/LOG_ORCHESTRATOR_<SOURCE>_<EXTRACT_TS>_<BATCH_ID>_<EXEC_TS>.log`.
+The orchestrator adheres to standard POSIX exit semantics:
 
----
-
-## 3. Teradata State Machine Database DDL
-
-State tables are created in `${TDENV}SIDFINTCH`:
-
-```sql
-CREATE MULTISET TABLE DEV0SIDFINTCH.BATCH_RUNS ,NO FALLBACK ,
-     NO BEFORE JOURNAL,
-     NO AFTER JOURNAL,
-     CHECKSUM = DEFAULT,
-     DEFAULT MERGEBLOCKRATIO
-     (
-        BATCH_ID VARCHAR(100) CHARACTER SET UNICODE NOT CASESPECIFIC NOT NULL,
-        SOURCE VARCHAR(50) CHARACTER SET UNICODE NOT CASESPECIFIC NOT NULL,
-        EXTRACT_TIMESTAMP VARCHAR(50) CHARACTER SET UNICODE NOT CASESPECIFIC,
-        RUN_DATE DATE FORMAT 'YYYY-MM-DD',
-        START_TIME TIMESTAMP(0),
-        END_TIME TIMESTAMP(0),
-        STATUS VARCHAR(20) CHARACTER SET UNICODE NOT CASESPECIFIC NOT NULL,
-        PROCESS_PID INTEGER
-     )
-PRIMARY INDEX ( BATCH_ID ,SOURCE );
-
--- Migration for existing environments:
--- ALTER TABLE DEV0SIDFINTCH.BATCH_RUNS ADD PROCESS_PID INTEGER;
-
-CREATE MULTISET TABLE DEV0SIDFINTCH.BATCH_TASKS ,NO FALLBACK ,
-     NO BEFORE JOURNAL,
-     NO AFTER JOURNAL,
-     CHECKSUM = DEFAULT,
-     DEFAULT MERGEBLOCKRATIO
-     (
-        BATCH_ID VARCHAR(100) CHARACTER SET UNICODE NOT CASESPECIFIC NOT NULL,
-        SOURCE VARCHAR(50) CHARACTER SET UNICODE NOT CASESPECIFIC NOT NULL,
-        EXTRACT_TIMESTAMP VARCHAR(50) CHARACTER SET UNICODE NOT CASESPECIFIC,
-        ENTITY_NAME VARCHAR(100) CHARACTER SET UNICODE NOT CASESPECIFIC NOT NULL,
-        FILE_NAME VARCHAR(500) CHARACTER SET UNICODE NOT CASESPECIFIC NOT NULL,
-        STATUS VARCHAR(20) CHARACTER SET UNICODE NOT CASESPECIFIC NOT NULL,
-        START_TIME TIMESTAMP(0),
-        END_TIME TIMESTAMP(0),
-        RETRY_COUNT INTEGER DEFAULT 0,
-        ERROR_MESSAGE VARCHAR(1000) CHARACTER SET UNICODE NOT CASESPECIFIC
-     )
-PRIMARY INDEX ( BATCH_ID ,SOURCE );
-```
+| Exit Code | Classification | Cause / Trigger | Operational Impact |
+|:---:|:---|:---|:---|
+| **`0`** | `SUCCESS / IDLE` | - Batch loaded, verified, transformed, and archived with 100% success.<br>- `LANDING_ZONE` is completely empty (`IDLE`). | System ready for subsequent batch. |
+| **`1`** | `FATAL / ABORT` | - Boundary violation OPS-01 (multiple manifests or unmanifested orphan files).<br>- Checksum mismatch on data payloads.<br>- Process lock wait timeout (`lock_timeout_seconds`) exceeded.<br>- TPT entity load failed after exhausting all retries.<br>- Downstream post-task failed. | Batch marked `FAILED` in `BATCH_RUNS`. Ingress halts immediately. |

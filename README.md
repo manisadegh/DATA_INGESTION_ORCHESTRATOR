@@ -5,9 +5,9 @@
 [![Database: Teradata Vantage](https://img.shields.io/badge/database-Teradata%20Vantage%2016.20+-orange.svg)](https://www.teradata.com/)
 [![License: Proprietary](https://img.shields.io/badge/license-Proprietary-red.svg)](#)
 
-A high-performance, fault-tolerant ELT ingestion orchestrator engineered to coordinate bulk flat-file data loads (Oracle Fusion BICC extracts, multi-source enterprise CSVs) into **Teradata Vantage** using the **Generic TPT Loader**.
+An enterprise batch-load orchestrator engineered to bridge standardized flat-file manifests with the high-throughput **Generic Teradata Parallel Transporter (TPT) Loader**.
 
-The orchestrator enforces a strict **Single-Batch Architecture** with atomic directory transitions, parallel entity-level worker threads, automated table unlock & retry capabilities, cryptographic checksum validation, unmanifested file boundary protection, and database-backed state persistence.
+The orchestrator enforces a strict **Single-Batch Architecture** with atomic directory transitions, process-level concurrency locking, pre-flight Teradata state sentries, automated in-flight crash recovery, parallel entity-level worker threads, automated table unlock & retry capabilities (Error 2652), cryptographic checksum validation, and unmanifested file boundary protection.
 
 ---
 
@@ -15,128 +15,101 @@ The orchestrator enforces a strict **Single-Batch Architecture** with atomic dir
 
 Comprehensive operational, technical, and testing manuals are available in the [`docs/`](docs/) directory:
 
-- 📖 **[User How-To & Configuration Guide](docs/01_user_how_to_guide.md)**: Command-line syntax, complete `config.json` reference, log inspection, and troubleshooting runbooks.
-- 📐 **[Functional Specification](docs/02_functional_specification.md)**: Plain-English architecture, OPS-01 single-batch gating, Solution A multi-chunk header stripping, and barrier logic.
-- ⚙️ **[Technical Manual & Function Inventory](docs/03_technical_manual_and_inventory.md)**: Module breakdowns (`sensor`, `db_state`, `tpt_worker`, `post_tasks`), state machine DDL, and concurrency design.
-- 🧪 **[Testing, Validation & QA Guide](docs/04_testing_and_qa_guide.md)**: Test matrices, orphan file injection, Error 2652 reactive lock recovery tests, and automated regression harnesses.
+- 📖 **[User How-To & Configuration Guide](docs/01_user_how_to_guide.md)**: Command-line syntax, complete `config.json` reference, in-flight recovery runbooks, and Teradata catalog monitoring.
+- 📐 **[Functional Specification](docs/02_functional_specification.md)**: Single-batch invariant (OPS-01), concurrency sentries, multi-chunk normalization (Solution A), and state machine lifecycle.
+- ⚙️ **[Technical Manual & Function Inventory](docs/03_technical_manual_and_inventory.md)**: Module breakdowns (`sensor`, `db_state`, `tpt_worker`, `post_tasks`), function signatures, and state machine DDL.
+- 🧪 **[Testing, Validation & QA Guide](docs/04_testing_and_qa_guide.md)**: Test matrices, orphan file injection, Error 2652 reactive lock recovery tests, concurrency tests, and automated regression harnesses.
 
 ---
 
 ## Table of Contents
 
-- [Key Features](#key-features)
-- [Architecture & Workflow](#architecture--workflow)
-  - [3-Tier Storage Model](#3-tier-storage-model)
-  - [Lifecycle Diagram](#lifecycle-diagram)
-- [Directory Layout](#directory-layout)
-- [Prerequisites & Dependencies](#prerequisites--dependencies)
-- [Database Setup (DDLs)](#database-setup-ddls)
-- [Configuration Reference](#configuration-reference)
-  - [1. Master Configuration (`config.json`)](#1-master-configuration-configjson)
-  - [2. Entity Mapping Dictionary (`entity_mapping.csv`)](#2-entity-mapping-dictionary-entity_mappingcsv)
-  - [3. Manifest Specification](#3-manifest-specification)
-- [Execution & CLI Usage](#execution--cli-usage)
-- [Operational Behaviors & Guardrails](#operational-behaviors--guardrails)
-  - [Single-Batch Gating](#single-batch-gating)
-  - [OPS-01 Orphan File Protection](#ops-01-orphan-file-protection)
-  - [Multi-Chunk CSV Header Normalization](#multi-chunk-csv-header-normalization)
-  - [In-Flight Crash Recovery](#in-flight-crash-recovery)
-  - [Auto-Healing & Lock Resolution (Error 2652)](#auto-healing--lock-resolution-error-2652)
-  - [Completeness Barrier & Post-Tasks](#completeness-barrier--post-tasks)
-- [Logging & Monitoring](#logging--monitoring)
-- [Security & Authentication](#security--authentication)
+- [Key Architectural Capabilities](#key-architectural-capabilities)
+- [Architecture & End-to-End Workflow](#architecture--end-to-end-workflow)
+- [Directory Layout & SAS Lifecycle](#directory-layout--sas-lifecycle)
+- [Core Invariants & Policies](#core-invariants--policies)
+  - [1. Single-Flight Concurrency & Active Polling](#1-single-flight-concurrency--active-polling)
+  - [2. Pre-Flight Teradata Sentry & Dead-PID Auto-Healing](#2-pre-flight-teradata-sentry--dead-pid-auto-healing)
+  - [3. Automated In-Flight Crash Resumption](#3-automated-in-flight-crash-resumption)
+  - [4. Single-Batch Gate (Invariant OPS-01)](#4-single-batch-gate-invariant-ops-01)
+  - [5. Zero Unmanifested Orphans (OPS-02)](#5-zero-unmanifested-orphans-ops-02)
+  - [6. Multi-Chunk Header Normalization (Solution A)](#6-multi-chunk-header-normalization-solution-a)
+  - [7. Reactive Lock Resolution (Error 2652)](#7-reactive-lock-resolution-error-2652)
+  - [8. State Machine & PID Audit Trail](#8-state-machine--pid-audit-trail)
+- [Configuration Reference (`config.json`)](#configuration-reference-configjson)
+- [Entity Mapping Dictionary (`entity_mapping.csv`)](#entity-mapping-dictionary-entity_mappingcsv)
+- [Usage & Execution](#usage--execution)
 - [Troubleshooting & Exit Codes](#troubleshooting--exit-codes)
 
 ---
 
-## Key Features
+## Key Architectural Capabilities
 
 - **Strict Single-Batch Gating**: Processes exactly one batch per execution cycle, preventing race conditions, lock collisions, and multi-tenant batch contention.
-- **Atomic 3-Tier Lifecycle**: Isolates batches from drop-off (`LANDING_ZONE`) to staging execution (`LOADING_ZONE`) and long-term archival (`ARCHIVE_ZONE`).
-- **Source-Aware Multi-Entity Mapping**: Supports multiple independent upstream sources (e.g., `ORACLE_FUSION`) feeding target staging tables with strict source isolation and inner extension awareness (`.csv` vs `.pecsv`).
-- **Multi-Chunk Asymmetry Handling**: Detects multi-part CSV extracts, normalizes headers on-the-fly (`SkipRows=0` after chunk 1 strip), and loads split extracts in a single high-speed wildcard TPT pass.
+- **Single-Flight Process Concurrency**: Manages `.orchestrator.pid` in `LOADING_ZONE/<SOURCE>` and enters an active polling wait loop on live PIDs, avoiding concurrent job collision.
+- **Pre-Flight Teradata Sentry & Auto-Healing**: Queries `${TDENV}SIDFINTCH.BATCH_RUNS` for running batches before execution. If an active PID is alive, it waits; if dead, it automatically reclassifies the orphaned batch as `FAILED`.
+- **Automated In-Flight Crash Resumption**: Interrupted runs inside `LOADING_ZONE` are automatically resumed upon re-invocation, bypassing redundant checksum verification and rerunning only pending/failed tasks.
+- **Isolated Processing SAS**: Atomically shifts data payloads from `LANDING_ZONE` to private `LOADING_ZONE`, ensuring that failed ingestions never corrupt the ingress gateway.
+- **In-Place Multi-Chunk Normalization (Solution A)**: For multi-chunk extracts, strips line 1 from Chunk 1 in-place and executes TPT using wildcard pattern with `SkipRows = 0`. Single-chunk extracts retain headers with `SkipRows = 1`.
+- **Concurrent Worker Pool**: Dispatches independent entity load jobs in parallel via `ThreadPoolExecutor` while honoring configurable concurrency limits (`max_concurrent_jobs`).
 - **Enterprise Auto-Healing**: Intercepts Teradata Error 2652 (`Table is locked for FastLoad / MultiLoad`), executes automated table unlocking via `unlock_tpt_table.sh`, and retries without manual intervention.
-- **Single-Flight Concurrency & Active Polling**: Manages `.orchestrator.pid` in `LOADING_ZONE`; actively polls on live PIDs until release, avoiding concurrent job collision.
-- **Cryptographic & Boundary Validation**: Validates MD5 manifest checksums and enforces strict boundary guards against unmanifested orphan files (OPS-01).
-- **Downstream Hooks & Hybrid Decoupling**: Merges source-specific tasks (`--post-tasks-file`) with global tasks (`post_ingestion_tasks`); bypasses execution cleanly when `--skip-post-tasks` is specified.
-- **Batch Capsule Hierarchy**: Organizes deliverables in `ARCHIVE_ZONE/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/` and logs in `LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/`.
-- **TPT Loader Working Directory Isolation**: Nests TPT job variables and logs inside the batch log capsule (`LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/TPT/`).
-- **Canonical Naming Compliance**: Standardizes log filenames (`LOG_ORCHESTRATOR_<SOURCE>_<EXTRACT_TS>_<BATCH_ID>_<EXEC_TS>.log`) and receipts.
+- **Permanent Process PID Audit**: Stores OS `PROCESS_PID` in `BATCH_RUNS` and permanently retains it upon completion (`SUCCESS` or `FAILED`).
+- **Chained Post-Tasks Pipeline**: Executes source-specific (`--post-tasks-file`) and global tasks (e.g. dbt models) only after 100% entity load success.
+- **Hybrid Decoupling Support**: Accepts `--skip-post-tasks` to bypass analytical models during bulk re-inits or operational maintenance.
 
 ---
 
-## Architecture & Workflow
-
-### 3-Tier Storage Model
-
-```text
-[Upstream Extract] ---> LANDING_ZONE ---> (Atomic Move) ---> LOADING_ZONE ---> (TPT FastLoad) ---> Teradata Staging
-                             |                                      |
-                     (Strict Gate: 1 MF)                    (Decompress & Strip)
-                                                                    |
-                                                            (100% Barrier OK)
-                                                                    |
-                                                                    v
-                                                              ARCHIVE_ZONE
-```
-
-### Lifecycle Diagram
+## Architecture & End-to-End Workflow
 
 ```mermaid
-stateDiagram-v2
-    [*] --> SENSING : Check LANDING_ZONE
-    
-    state SENSING {
-        [*] --> Gating_Check
-        Gating_Check --> Reject_Multiple : Found > 1 Manifest
-        Gating_Check --> Reject_Orphan : Found Unmanifested File (OPS-01)
-        Gating_Check --> Checksum_Verify : Exactly 1 Manifest
-        Checksum_Verify --> Reject_Checksum : MD5 Mismatch
-        Checksum_Verify --> Validated : Checksums OK
-    }
+flowchart TD
+    subgraph PREFLIGHT["1. Concurrency & Pre-Flight Sentry"]
+        DB_CHECK{Active Batch in BATCH_RUNS?}
+        DB_CHECK -- Yes (PID Alive) --> WAIT_DB[Active Polling Wait Loop]
+        DB_CHECK -- Yes (PID Dead) --> HEAL[Auto-Heal: Set STATUS=FAILED] --> PID_CHECK
+        DB_CHECK -- No --> PID_CHECK{Active .orchestrator.pid?}
+        PID_CHECK -- Yes --> WAIT_PID[Active Polling Wait Loop]
+        PID_CHECK -- No --> INFLIGHT{In-Flight *.MF in LOADING_ZONE?}
+    end
 
-    Reject_Multiple --> [*] : Exit RC 1
-    Reject_Orphan --> [*] : Exit RC 1
-    Reject_Checksum --> [*] : Exit RC 1
+    subgraph INGRESS["2. Ingress & Single-Batch Gating"]
+        INFLIGHT -- No --> SCAN[Scan LANDING_ZONE/<SOURCE>/]
+        SCAN --> GATE{OPS-01 Check: Exactly 1 Manifest & 0 Orphans?}
+        GATE -- No --> ABORT[Fatal Abort: RC 1]
+        GATE -- Yes --> MD5[Verify MD5 Checksums]
+        MD5 --> ATOMIC_MOVE[Atomic Move: LANDING_ZONE -> LOADING_ZONE]
+    end
 
-    SENSING --> LOADING_ISOLATION : Atomic Move to LOADING_ZONE
-    
-    state LOADING_ISOLATION {
-        [*] --> Decompress_Archives : Unpack .zip / .gz
-        Decompress_Archives --> Header_Normalize : Strip Chunk 1 Header (Solution A)
-        Header_Normalize --> Register_State : Insert BATCH_RUNS (RUNNING)
-    }
+    subgraph ISOLATION["3. SAS Processing & State Init"]
+        INFLIGHT -- Yes --> INFLIGHT_RESUME[Resume In-Flight: Bypass Checksum]
+        ATOMIC_MOVE --> DECOMP[Decompress Archives .zip / .gz]
+        INFLIGHT_RESUME --> DECOMP
+        DECOMP --> CHUNKS{Multi-Chunk Delimited?}
+        CHUNKS -- Yes --> STRIP[Strip Chunk 1 Header: SkipRows=0]
+        CHUNKS -- No --> SINGLE[Retain Header: SkipRows=1]
+        STRIP --> DB_INIT[Register BATCH_RUNS & BATCH_TASKS]
+        SINGLE --> DB_INIT
+    end
 
-    LOADING_ISOLATION --> PARALLEL_EXECUTION : ThreadPoolExecutor Dispatch
-    
-    state PARALLEL_EXECUTION {
-        [*] --> Task_Worker
-        Task_Worker --> Run_TPT : load_csv_generic.sh
-        Run_TPT --> Success_Task : TPT Exit 0 or 4
-        Run_TPT --> Lock_Detected : Error 2652
-        Lock_Detected --> Auto_Unlock : unlock_tpt_table.sh
-        Auto_Unlock --> Run_TPT : Retry Attempt
-    }
+    subgraph EXECUTION["4. Parallel Workers & Auto-Healing"]
+        DB_INIT --> POOL[ThreadPoolExecutor: Max Concurrent Jobs]
+        POOL --> TPT[load_csv_generic.sh]
+        TPT -->|Lock Error 2652| UNLOCK[unlock_tpt_table.sh] --> TPT
+        TPT -->|Success| TASK_OK[Update BATCH_TASKS = SUCCESS]
+    end
 
-    PARALLEL_EXECUTION --> POST_PROCESSING : All Tasks Succeeded
-    
-    state POST_PROCESSING {
-        [*] --> Completeness_Barrier
-        Completeness_Barrier --> Run_Hooks : 100% Success
-        Run_Hooks --> Move_Archive : Relocate to ARCHIVE_ZONE
-        Move_Archive --> Commit_Success : Set BATCH_RUNS = SUCCESS
-    }
-
-    POST_PROCESSING --> [*] : Exit RC 0
+    subgraph COMPLETION["5. Barrier & Archiving"]
+        TASK_OK --> BARRIER{100% Entities Succeeded?}
+        BARRIER -- Yes --> POST[Run Post-Tasks: Source + Global]
+        POST --> ARCHIVE[Move Batch to ARCHIVE_ZONE]
+        ARCHIVE --> COMMIT[Set BATCH_RUNS = SUCCESS + Preserved PID]
+        BARRIER -- No --> FAIL[Mark BATCH_RUNS = FAILED]
+    end
 ```
 
 ---
 
-## Configuration Reference
-
-### Master Configuration (`config.json`)
-
-The orchestrator configuration uses portable relative paths and environment variable expansion:
+## Configuration Reference (`config.json`)
 
 ```json
 {
@@ -166,6 +139,10 @@ The orchestrator configuration uses portable relative paths and environment vari
     "entity_mapping_file": "../../CONFIG/entity_mapping.csv",
     "verify_checksum": true,
     "allow_orphan_files": false,
+    "concurrency": {
+      "poll_interval_seconds": 5,
+      "lock_timeout_seconds": 7200
+    },
     "post_ingestion_tasks": [
       {
         "type": "shell",
@@ -190,11 +167,16 @@ ORACLE_FUSION,ERP_MSH_USER_AK,userpvo,".pecsv,.zip,.gz,.pecsv.gz",.pecsv
 
 ---
 
-## Execution & CLI Usage
+## Usage & Execution
 
-### Standard Orchestrator Run
+### Standard Batch Ingestion
 ```bash
 python3 orchestrator.py --config config.json
+```
+
+### Ingestion with Source Override
+```bash
+python3 orchestrator.py --config config.json --source ORACLE_FUSION
 ```
 
 ### Ingestion with Post-Tasks Skipped
@@ -202,12 +184,12 @@ python3 orchestrator.py --config config.json
 python3 orchestrator.py --config config.json --skip-post-tasks
 ```
 
-### Source-Specific / Delegated Ingestion
+### Ingestion with Source Post-Tasks File
 ```bash
-python3 orchestrator.py --config config.json --source <SOURCE> --post-tasks-file /path/to/post_tasks.json
+python3 orchestrator.py --config config.json --source ORACLE_FUSION --post-tasks-file /path/to/POST_TASKS.json
 ```
 
-If `LANDING_ZONE` is empty, the orchestrator exits cleanly with Return Code `0` (`IDLE`).
+If `LANDING_ZONE` contains no manifests and no files, the orchestrator exits cleanly with Return Code `0` (`IDLE`).
 
 ---
 
@@ -215,7 +197,7 @@ If `LANDING_ZONE` is empty, the orchestrator exits cleanly with Return Code `0` 
 
 | Exit Code | Meaning | Action |
 | :---: | :--- | :--- |
-| `0` | Batch ingested and archived successfully, or `LANDING_ZONE` is empty (`IDLE`). | Normal operation. |
-| `1` | OPS-01 violation (orphans / multiple manifests), checksum failure, or TPT task error. | Inspect `LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/LOG_ORCHESTRATOR_*.log` and Teradata `BATCH_TASKS` table. |
+| `0` | Batch loaded, verified, transformed, and archived with 100% success, or `LANDING_ZONE` is empty (`IDLE`). | Normal operation. |
+| `1` | Boundary violation (OPS-01), checksum failure, lock timeout, or unrecoverable worker failure. | Inspect batch log in `LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/` and Teradata `BATCH_TASKS` table. |
 
 For detailed failure scenarios, error runbooks, and recovery instructions, consult **[docs/01_user_how_to_guide.md](docs/01_user_how_to_guide.md)**.

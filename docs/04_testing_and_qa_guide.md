@@ -2,57 +2,60 @@
 
 ## 1. Testing Scope & Objectives
 
-The **DATA_INGESTION_ORCHESTRATOR** test framework verifies the orchestrator's contract enforcement, multi-threaded worker dispatch, archive decompression, header normalization, and database state transitions.
+The testing framework for the **DATA_INGESTION_ORCHESTRATOR** verifies the single-batch contract, concurrency sentries, crash resilience, TPT execution, and Teradata technical metadata integrity.
 
+### Validation Boundaries
 ```mermaid
 flowchart LR
-    subgraph TestVectors["Input Scenarios"]
-        T1["Single-Entity CSV"]
-        T2["Multi-Entity Concurrency"]
-        T3["Compressed ZIP Archive"]
-        T4["Multi-Chunk CSV (Solution A)"]
-        T5["OPS-01 Orphan File"]
-        T6["Multiple Manifests"]
-        T7["Corrupted MD5 Checksum"]
-        T8["Table Locked (Error 2652)"]
+    subgraph Inputs["Test Vectors"]
+        T1["Nominal Multi-Entity Batch"]
+        T2["ZIP Archive Batch (.zip / .gz)"]
+        T3["Multi-Chunk Extract (Solution A)"]
+        T4["Orphan Stray File (OPS-01)"]
+        T5["Multiple Manifests (OPS-01)"]
+        T6["Checksum Corruption"]
+        T7["Locked Target Table (Error 2652)"]
+        T8["In-Flight Crash Resumption"]
+        T9["Concurrent Orchestrator Contention"]
+        T10["Stale Dead-PID Lockfile"]
     end
 
-    subgraph OrchestratorEngine["Orchestrator Engine Under Test"]
-        Sensor["Sensor & Gate"]
-        Decomp["ZIP / GZ Decompressor"]
-        Pool["ThreadPool (Workers = N)"]
-        Recovery["2652 Lock Recovery"]
+    subgraph Orchestrator["Orchestration Engine"]
+        Sentry["Concurrency & Crash Sentry"]
+        Gate["Single-Batch Sensor"]
+        SAS["Loading Zone Isolation SAS"]
+        TPT["ThreadPool & TPT Worker"]
+        State["Teradata BATCH_RUNS & TASKS"]
     end
 
-    subgraph OutputAssertions["Verified Assertions"]
-        A1["OPS-01 Rejection (RC 1)"]
-        A2["Multi-Manifest Rejection (RC 1)"]
-        A3["Checksum Mismatch Abort (RC 1)"]
-        A4["Solution A Header Stripped (Chunk 1)"]
-        A5["Teradata BATCH_RUNS = SUCCESS"]
-        A6["Files Relocated to ARCHIVE_ZONE"]
+    subgraph Assertions["Verified Outcomes"]
+        A1["Atomic Move: LANDING -> LOADING"]
+        A2["Chunk 1 Header Stripping (SkipRows=0)"]
+        A3["Fatal Abort (RC 1) on OPS-01 / Checksum"]
+        A4["Auto-Unlock via unlock_tpt_table.sh"]
+        A5["Teradata BATCH_RUNS = SUCCESS + PROCESS_PID"]
+        A6["Final Capsule in ARCHIVE_ZONE"]
+        A7["Active Wait Loop Collision Avoidance"]
+        A8["In-Flight Delta Task Completion"]
     end
 
-    TestVectors --> OrchestratorEngine --> OutputAssertions
+    Inputs --> Orchestrator --> Assertions
 ```
 
 ---
 
-## 2. Test Environment Setup & Prerequisites
+## 2. Test Environment & Sandpit Setup
 
 Tests should be executed in an isolated sandpit to avoid locks on active production staging tables:
 
 ```bash
-# Setup sandbox
-export TEST_DIR="/sg/local/sid/home/Dsidadm/DATA_LOADER/ORCH_TEST"
-mkdir -p "${TEST_DIR}/LANDING_ZONE"
-mkdir -p "${TEST_DIR}/LOADING_ZONE"
-mkdir -p "${TEST_DIR}/ARCHIVE_ZONE"
-mkdir -p "${TEST_DIR}/LOGS"
-mkdir -p "${TEST_DIR}/CONFIG"
+export ORCH_TEST_DIR="/sg/local/sid/home/Dsidadm/DATA_LOADER/ORCH_TEST"
+mkdir -p "${ORCH_TEST_DIR}/LANDING_ZONE"
+mkdir -p "${ORCH_TEST_DIR}/LOADING_ZONE"
+mkdir -p "${ORCH_TEST_DIR}/ARCHIVE_ZONE"
+mkdir -p "${ORCH_TEST_DIR}/LOGS"
 
-# Copy entity mapping
-cp /sg/local/sid/home/Dsidadm/DATA_LOADER/CONFIG/entity_mapping.csv "${TEST_DIR}/CONFIG/"
+cp /sg/local/sid/home/Dsidadm/DATA_LOADER/CONFIG/entity_mapping.csv "${ORCH_TEST_DIR}/"
 ```
 
 ### Test Configuration (`orch_test_config.json`)
@@ -63,33 +66,36 @@ cp /sg/local/sid/home/Dsidadm/DATA_LOADER/CONFIG/entity_mapping.csv "${TEST_DIR}
     "loading_zone": "/sg/local/sid/home/Dsidadm/DATA_LOADER/ORCH_TEST/LOADING_ZONE",
     "archive_zone": "/sg/local/sid/home/Dsidadm/DATA_LOADER/ORCH_TEST/ARCHIVE_ZONE",
     "logs_dir": "/sg/local/sid/home/Dsidadm/DATA_LOADER/ORCH_TEST/LOGS",
-    "entity_mapping_file": "/sg/local/sid/home/Dsidadm/DATA_LOADER/ORCH_TEST/CONFIG/entity_mapping.csv",
-    "max_concurrent_entities": 2,
-    "max_retries_per_entity": 1,
+    "entity_mapping_file": "/sg/local/sid/home/Dsidadm/DATA_LOADER/ORCH_TEST/entity_mapping.csv",
+    "max_concurrent_jobs": 2,
+    "manifest_pattern": "MANIFEST_*.MF",
     "verify_checksum": true,
-    "allow_orphan_files": false
+    "allow_orphan_files": false,
+    "concurrency": {
+      "poll_interval_seconds": 2,
+      "lock_timeout_seconds": 30
+    },
+    "post_ingestion_tasks": [
+      {
+        "type": "shell",
+        "command": "echo 'Orchestration test completed for batch $CURRENT_BATCH_ID'"
+      }
+    ]
   },
   "tpt": {
     "wrapper_script": "../TPT_LOADER/load_csv_generic.sh",
     "unlock_script": "../TPT_LOADER/unlock_tpt_table.sh",
     "default_load_mode": "replace",
-    "target_database": "${TDENV}SIDFINSTG",
-    "work_database": "${TDENV}SIDFINWRK",
-    "logon_user": "${TDENV}${SID_ADM_USER}"
+    "target_db": "${TDENV}SIDFINSTG",
+    "work_db": "${TDENV}SIDFINWRK",
+    "timeout_seconds": 600
   },
   "teradata": {
     "host": "${TDPID}",
     "user": "${TDENV}${SID_ADM_USER}",
     "technical_database": "${TDENV}SIDFINTCH",
     "logmech": "TD2"
-  },
-  "post_tasks": [
-    {
-      "name": "Audit Task",
-      "type": "shell",
-      "command": "echo 'Orchestration test completed for batch {batch_id}'"
-    }
-  ]
+  }
 }
 ```
 
@@ -109,7 +115,7 @@ cp /sg/local/sid/home/Dsidadm/DATA_LOADER/CONFIG/entity_mapping.csv "${TEST_DIR}
 | **TC-ORCH-08** | In-Flight Crash Resumption | Pre-existing files in `LOADING_ZONE` | Bypasses `LANDING_ZONE`, completes remaining tasks, archives batch. | 0 |
 | **TC-ORCH-09** | Concurrency & Active Polling Wait | 2 concurrent Orchestrator executions | Detects `.orchestrator.pid`, enters active polling loop until release. | 0 |
 | **TC-ORCH-10** | Hybrid Decoupling (`--skip-post-tasks`) | Batch with `--skip-post-tasks` | Ingests data, skips all post-tasks, logs bypass trace. | 0 |
-| **TC-ORCH-11** | Stale PID Cleanup & Crash Recovery | Pre-existing batch with dead PID in lockfile | Cleans dead PID lock, resumes in-flight tasks safely. | 0 |
+| **TC-ORCH-11** | Stale PID Cleanup & Dead-PID Recovery | Pre-existing batch with dead PID in lockfile | Cleans dead PID lock, marks dead batch FAILED, resumes safely. | 0 |
 | **TC-ORCH-12** | Source Post-Tasks Merge & Skip | `--post-tasks-file` + `--skip-post-tasks` | Merges external source tasks; cleanly skips all tasks when flag passed. | 0 |
 | **TC-ORCH-13** | Teradata DB, Storage & PID Audit | Batch 9007 verified via Python auditor | Asserts `PROCESS_PID` is NOT NULL in `BATCH_RUNS`, rows loaded, storage clean. | 0 |
 
@@ -124,13 +130,8 @@ cp /sg/local/sid/home/Dsidadm/DATA_LOADER/CONFIG/entity_mapping.csv "${TEST_DIR}
 - **Objective**: Verify that the orchestrator rejects batches if any unmanifested data file is present in `LANDING_ZONE`.
 - **Procedure**:
   ```bash
-  # Stage valid batch into LANDING_ZONE
   cp /sg/local/sid/home/Dsidadm/DATA_LOADER/DATA/TEST_BATCH_1/* /sg/local/sid/home/Dsidadm/DATA_LOADER/ORCH_TEST/LANDING_ZONE/
-  
-  # Inject stray unmanifested orphan file
   echo "orphan_data" > /sg/local/sid/home/Dsidadm/DATA_LOADER/ORCH_TEST/LANDING_ZONE/unmanifested_stray_file.csv
-  
-  # Execute Orchestrator
   python3 orchestrator.py --config /sg/local/sid/home/Dsidadm/DATA_LOADER/ORCH_TEST/orch_test_config.json
   ```
 - **Assertions**:
@@ -168,6 +169,49 @@ cp /sg/local/sid/home/Dsidadm/DATA_LOADER/CONFIG/entity_mapping.csv "${TEST_DIR}
 
 ---
 
+### Test Case: TC-ORCH-08 (In-Flight Crash Resumption)
+- **Objective**: Validate that a batch interrupted inside `LOADING_ZONE` resumes safely without re-verifying checksums.
+- **Procedure**:
+  1. Place an uncompleted standardized manifest and data files directly into `LOADING_ZONE/`.
+  2. Execute Orchestrator.
+- **Assertions**:
+  - Log asserts: `In-flight batch detected in LOADING_ZONE: ... Resuming execution.`
+  - Checksum validation is bypassed.
+  - Remaining entity tasks are loaded via TPT into Teradata.
+  - Completed batch is archived to `ARCHIVE_ZONE/`.
+
+---
+
+### Test Case: TC-ORCH-09 (Process Concurrency & Active Polling Wait)
+- **Objective**: Validate that two concurrent Orchestrator executions for the same source do not collide.
+- **Procedure**:
+  ```bash
+  python3 orchestrator.py --config orch_test_config.json &
+  PID_1=$!
+  sleep 1
+  python3 orchestrator.py --config orch_test_config.json
+  wait $PID_1
+  ```
+- **Assertions**:
+  - Instance 2 detects `.orchestrator.pid` with PID of Instance 1.
+  - Instance 2 logs: `Another Orchestrator run is actively in progress (PID ...). Entering active waiting loop...`
+  - Instance 2 polls until Instance 1 finishes, avoiding Teradata session collisions.
+
+---
+
+### Test Case: TC-ORCH-11 (Stale PID Cleanup & Dead-PID Recovery)
+- **Objective**: Validate that a dead PID in `.orchestrator.pid` or `BATCH_RUNS` is auto-healed.
+- **Procedure**:
+  1. Write a dummy non-existent PID (e.g. `999999`) to `LOADING_ZONE/.orchestrator.pid`.
+  2. Insert a row in `BATCH_RUNS` with `STATUS = 'RUNNING'` and `PROCESS_PID = 999999`.
+  3. Execute Orchestrator.
+- **Assertions**:
+  - Orchestrator logs: `Batch ... was marked RUNNING in BATCH_RUNS with dead PID 999999. Reclassifying as FAILED.`
+  - Dead PID file `.orchestrator.pid` is pruned.
+  - Orchestrator writes its own PID and processes the incoming batch cleanly.
+
+---
+
 ## 5. Automated Regression Test Script
 
 ```bash
@@ -179,15 +223,15 @@ CONFIG="/sg/local/sid/home/Dsidadm/DATA_LOADER/ORCH_TEST/orch_test_config.json"
 
 echo "=== Starting Data Ingestion Orchestrator Regression Test Suite ==="
 
-# Test 1: Idle Run (Empty Landing Zone -> RC 0)
+# Test 1: Empty Landing Zone (RC 0 expected)
 python3 "${ORCH_DIR}/orchestrator.py" --config "${CONFIG}"
-echo "[PASS] Idle run completed with RC 0."
+echo "[PASS] Empty landing zone handled gracefully."
 
-# Test 2: Standard Batch Run
-cp /sg/local/sid/home/Dsidadm/DATA_LOADER/DATA/TEST_BATCH_12/* \
+# Test 2: Standard Single-Batch Load
+cp /sg/local/sid/home/Dsidadm/DATA_LOADER/DATA/TEST_BATCH_1/* \
    /sg/local/sid/home/Dsidadm/DATA_LOADER/ORCH_TEST/LANDING_ZONE/
 python3 "${ORCH_DIR}/orchestrator.py" --config "${CONFIG}"
-echo "[PASS] Batch 12 ingested and archived."
+echo "[PASS] Single batch processed and archived."
 
-echo "=== All Orchestrator Tests Completed Successfully ==="
+echo "=== All Orchestrator Tests Passed Successfully ==="
 ```

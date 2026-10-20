@@ -24,6 +24,10 @@
     "entity_mapping_file": "../../CONFIG/entity_mapping.csv",
     "verify_checksum": true,
     "allow_orphan_files": false,
+    "concurrency": {
+      "poll_interval_seconds": 5,
+      "lock_timeout_seconds": 7200
+    },
     "post_ingestion_tasks": [
       {
         "type": "shell",
