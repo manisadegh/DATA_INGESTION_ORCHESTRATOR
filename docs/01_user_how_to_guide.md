@@ -2,7 +2,7 @@
 
 ## 1. Overview & Operational Role
 
-The **DATA_INGESTION_ORCHESTRATOR** (`orchestrator.py`) is the Tier-2 engine supervisor of the `DATA_LOADER` framework. It implements a strict **Single-Batch Architecture**: it ingests exactly one manifested batch per execution, guaranteeing complete transaction boundaries, isolated worker processing, automated crash recovery, and detailed state tracking in Teradata Vantage.
+The **DATA_INGESTION_ORCHESTRATOR** (`orchestrator.py`) is the Tier-2 engine supervisor of the `DATA_LOADER` framework. It implements a **Multi-Batch FIFO Queue Consumer** (with backward compatibility for single-batch flat manifests): it drains 1..N queued Batch Capsules from `LANDING_ZONE/<SOURCE>/` in chronological FIFO order, performs fast-path $O(1)$ size validation, executes Just-In-Time Schema Guard DDL synchronization, manages parallel entity loading, and archives consolidated Batch Capsules into `ARCHIVE_ZONE`.
 
 ```mermaid
 flowchart TD
@@ -15,26 +15,28 @@ flowchart TD
         ResumeInFlight["Resume In-Flight Batch (Skip Checksum, Rerun Remaining)"]
     end
 
-    subgraph INGRESS["2. Ingress & Gating (DATA/LANDING_ZONE)"]
-        Gate{"Single-Batch Sensor<br/>(OPS-01 Gating)"}
-        Transfer["Atomic Move: LANDING_ZONE -> LOADING_ZONE"]
+    subgraph QUEUE["2. Multi-Batch Queue Discovery (LANDING_ZONE)"]
+        Scan["Scan Landing Queue (scan_landing_queue)"]
+        FIFO["Sort Queued Capsules Chronologically (FIFO)"]
+        Loop["FIFO Queue Loop (FAIL_STOP)"]
     end
 
-    subgraph ISOLATION["3. SAS Processing (DATA/LOADING_ZONE)"]
-        Decomp["Decompress Archives (.zip / .gz)"]
-        Norm["Multi-Chunk Header Stripping<br/>(Chunk 1: SkipRows=0)"]
+    subgraph PREP["3. Just-In-Time Schema Guard & DDL Sync"]
+        JIT["JIT Schema Guard (sync_entity_schema_if_drifted)"]
+        DDL["Auto-DDL Recreate (NOPI VARCHAR 4000)"]
     end
 
     subgraph EXEC["4. Parallel Ingestion & State Machine"]
         Pool["ThreadPoolExecutor (Entity Workers)"]
         State["Teradata BATCH_RUNS & BATCH_TASKS (PROCESS_PID Recorded)"]
-        TPT["load_csv_generic.sh (TPT Loader)"]
+        TPT["load_csv_generic.sh (-C -M 2 Fast-Path)"]
         Unlock["unlock_tpt_table.sh (Reactive 2652 Recovery)"]
     end
 
-    subgraph EGRESS["5. Post-Tasks & Archiving"]
-        Post["Post-Tasks (Source + Global dbt / scripts)"]
-        Archive["Final Batch Capsule Archiving"]
+    subgraph EGRESS["5. Post-Tasks & Capsule Archiving"]
+        Post["Post-Tasks (Source-keyed + Global)"]
+        Receipt["Update RAW/RECEIPT_*.json with Schema Actions"]
+        Archive["Consolidate Capsule into ARCHIVE_ZONE"]
     end
 
     DBSentry -- Yes (PID Alive) --> WaitDB
@@ -42,12 +44,13 @@ flowchart TD
     DBSentry -- No --> PIDSentry
     PIDSentry -- Yes --> WaitPID
     PIDSentry -- No --> InFlightCheck
-    InFlightCheck -- Yes --> ResumeInFlight --> Pool
-    InFlightCheck -- No --> Gate
-    Gate -->|1 Manifest & Valid Files| Transfer --> Decomp --> Norm --> Pool
-    Gate -->|>1 Manifests or Orphans| Abort["Fatal Abort (RC 1)"]
+    InFlightCheck -- Yes --> ResumeInFlight --> JIT
+    InFlightCheck -- No --> Scan --> FIFO --> Loop
+    Loop --> JIT --> DDL --> Pool
     Pool -->|Spawn per Entity| TPT
     TPT -->|Lock Error 2652| Unlock -->|Resume| TPT
+    TPT -->|100% Success| Post --> Receipt --> Archive
+```
     Pool <-->|Update Status| State
     Pool -->|100% Entities Succeeded| Post --> Archive
 ```

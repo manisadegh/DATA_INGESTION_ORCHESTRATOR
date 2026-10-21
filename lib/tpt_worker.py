@@ -17,7 +17,10 @@ def run_tpt_loader(
     skip_rows=1,
     skip_rows_every_file="N",
     extract_timestamp=None,
-    source: Optional[str] = None
+    source: Optional[str] = None,
+    skip_precheck: bool = False,
+    has_meta: int = 2,
+    work_zone: Optional[str] = None,
 ):
     """
     Executes the bash wrapper for TPT in a subprocess with auto-healing.
@@ -30,7 +33,10 @@ def run_tpt_loader(
         orch_config = {}
 
     ts_info = f", ExtractTS '{extract_timestamp}'" if extract_timestamp else ""
-    logger.info(f"Starting TPT for entity '{entity}' (Batch {batch_id}{ts_info}, Retry {retry_count}, Mode {load_mode}, SkipRows {skip_rows}, SkipRowsEveryFile {skip_rows_every_file})")
+    logger.info(
+        f"Starting TPT for entity '{entity}' (Batch {batch_id}{ts_info}, Retry {retry_count}, Mode {load_mode}, "
+        f"SkipRows {skip_rows}, SkipRowsEveryFile {skip_rows_every_file}, SkipPrecheck {skip_precheck}, HasMeta {has_meta})"
+    )
     
     # Mark task start in DB
     if db_state:
@@ -50,7 +56,7 @@ def run_tpt_loader(
     else:
         tpt_env = tpt_env.copy()
         
-    loading_zone = orch_config.get('loading_zone', orch_config.get('landing_zone'))
+    loading_zone = work_zone or orch_config.get('loading_zone', orch_config.get('landing_zone'))
     
     # Check if full path already provided or relative to loading_zone
     if os.path.isabs(file_path_or_pattern) or file_path_or_pattern.startswith('/tmp') or file_path_or_pattern.startswith('//'):
@@ -72,6 +78,10 @@ def run_tpt_loader(
     if extract_timestamp:
         cmd.extend(["-T", str(extract_timestamp)])
     
+    if skip_precheck:
+        cmd.append("-C")
+        cmd.extend(["-M", str(has_meta)])
+
     if work_dir:
         os.makedirs(work_dir, exist_ok=True)
         cmd.extend(["-w", str(work_dir)])

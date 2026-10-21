@@ -6,6 +6,13 @@
     "technical_database": "${TDENV}SIDFINTCH",
     "connection_pool_size": 6
   },
+  "schema_guard": {
+    "enabled": true,
+    "auto_migrate_ddl": true,
+    "default_column_type": "VARCHAR(4000)",
+    "character_set": "UNICODE",
+    "target_database": "${TDENV}SIDFINSTG"
+  },
   "tpt": {
     "wrapper_script": "../TPT_LOADER/load_csv_generic.sh",
     "unlock_script": "../TPT_LOADER/unlock_tpt_table.sh",
@@ -24,16 +31,25 @@
     "manifest_regex": "^MANIFEST_([A-Za-z0-9_]+)_(\\d{8}_\\d{6})_([A-Za-z0-9_-]+)\\.MF$",
     "entity_mapping_file": "../../CONFIG/entity_mapping.csv",
     "verify_checksum": true,
+    "verify_checksum_on_queued_capsule": false,
     "allow_orphan_files": false,
     "concurrency": {
       "poll_interval_seconds": 5,
       "lock_timeout_seconds": 7200
     },
-    "post_ingestion_tasks": [
-      {
-        "type": "shell",
-        "command": "echo 'Ingestion completed for batch $CURRENT_BATCH_ID from source $CURRENT_SOURCE'"
-      }
-    ]
+    "post_ingestion_tasks": {
+      "ORACLE_FUSION": [
+        {
+          "type": "shell",
+          "command": "echo 'Post-task specific to BICC / ORACLE_FUSION completed for batch $CURRENT_BATCH_ID'"
+        }
+      ],
+      "default": [
+        {
+          "type": "shell",
+          "command": "echo 'Ingestion completed for batch $CURRENT_BATCH_ID from source $CURRENT_SOURCE'"
+        }
+      ]
+    }
   }
 }
