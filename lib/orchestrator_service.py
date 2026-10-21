@@ -126,7 +126,7 @@ def process_entity_task(
     Handles single files vs multi-chunk extracts and header normalization.
     """
     logger = logging.getLogger("DATA_INGESTION_ORCHESTRATOR")
-    loading_zone = orch_config.get("loading_zone", orch_config["landing_zone"])
+    loading_zone = orch_config.get("loading_zone") or orch_config.get("landing_zone", "")
     files = sorted(entity_info["files"])
     signature = entity_info.get("signature", entity.lower())
 
