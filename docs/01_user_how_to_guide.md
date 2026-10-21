@@ -147,8 +147,7 @@ During in-flight recovery:
     "default_load_mode": "replace",
     "target_db": "${TDENV}SIDFINSTG",
     "work_db": "${TDENV}SIDFINWRK",
-    "timeout_seconds": 3600,
-    "work_dir": "../../LOGS/tpt_work"
+    "timeout_seconds": 3600
   },
   "teradata": {
     "host": "${TDPID}",
@@ -187,7 +186,9 @@ During in-flight recovery:
 | `target_db` | String | `${TDENV}SIDFINSTG` | Target staging database. |
 | `work_db` | String | `${TDENV}SIDFINWRK` | Database for TPT utility tables (`LG_`, `ET_`, `UV_`, `WT_`). |
 | `timeout_seconds` | Integer | `3600` | Timeout in seconds for individual TPT child processes. |
-| `work_dir` | String | `../../LOGS/tpt_work` | Dedicated base working directory for TPT (overridden at runtime to nest inside the Batch Log Capsule). |
+
+> [!NOTE]
+> The TPT working directory is automatically synthesized at runtime and nested inside the Batch Log Capsule (`LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/TPT/`).
 
 ---
 
@@ -251,12 +252,12 @@ ORDER BY START_TIME ASC;
   ```text
   TPT Job failed with error 2652: Operation not allowed: table is being Loaded / Paused.
   ```
-- **Automated Behavior**: The orchestrator automatically invokes `unlock_tpt_table.sh -t <TABLE> -m <MODE>` and retries the entity task up to `max_retries_per_entity`.
+- **Automated Behavior**: The orchestrator automatically invokes `unlock_tpt_table.sh -t <TABLE> -m <MODE> -B <BATCH_ID> -T <EXTRACT_TS>` and retries the entity task up to `max_retries_per_entity`.
 - **Manual Resolution (if retries exhausted)**:
   Run the unlock tool directly:
   ```bash
   cd /sg/local/sid/home/Dsidadm/DATA_LOADER/PROCESSING_TOOLS/TPT_LOADER
-  ./unlock_tpt_table.sh -t ERP_MSH_INVOICE_HEADER -m replace -d DEV0SIDFINSTG -u DEV0SIDFINADM
+  ./unlock_tpt_table.sh -t ERP_MSH_INVOICE_HEADER -m replace -d DEV0SIDFINSTG -u DEV0SIDFINADM -B <BATCH_ID> -T <EXTRACT_TS>
   ```
 
 ---

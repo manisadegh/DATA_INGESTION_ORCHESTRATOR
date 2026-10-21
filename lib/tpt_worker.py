@@ -1,10 +1,24 @@
 import logging
 import subprocess
 import os
+from typing import Optional
 
 logger = logging.getLogger("DATA_INGESTION_ORCHESTRATOR")
 
-def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_config=None, orch_config=None, db_state=None, load_mode="replace", skip_rows=1, skip_rows_every_file="N", extract_timestamp=None):
+def run_tpt_loader(
+    entity,
+    file_path_or_pattern,
+    retry_count,
+    batch_id,
+    tpt_config=None,
+    orch_config=None,
+    db_state=None,
+    load_mode="replace",
+    skip_rows=1,
+    skip_rows_every_file="N",
+    extract_timestamp=None,
+    source: Optional[str] = None
+):
     """
     Executes the bash wrapper for TPT in a subprocess with auto-healing.
     Operates strictly in the isolated LOADING_ZONE for a Single Batch.
@@ -14,18 +28,13 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
         tpt_config = {}
     if orch_config is None:
         orch_config = {}
-    if hasattr(orch_config, 'update_task_start') and db_state is None:
-        # Legacy positional signature: (entity, file, retry, batch, orch_config, db_state)
-        db_state = orch_config
-        orch_config = tpt_config
-        tpt_config = {}
 
     ts_info = f", ExtractTS '{extract_timestamp}'" if extract_timestamp else ""
-    logger.info(f"Starting TPT for entity '{entity}' (Batch {batch_id}{ts_info}, Retry {retry_count}, Mode {load_mode}, SkipRows {skip_rows})")
+    logger.info(f"Starting TPT for entity '{entity}' (Batch {batch_id}{ts_info}, Retry {retry_count}, Mode {load_mode}, SkipRows {skip_rows}, SkipRowsEveryFile {skip_rows_every_file})")
     
     # Mark task start in DB
     if db_state:
-        db_state.update_task_start(batch_id, entity)
+        db_state.update_task_start(batch_id, entity, source=source)
     
     # Resolve TPT specific variables from tpt_config, falling back to orch_config
     script_path = tpt_config.get('wrapper_script') or orch_config.get('tpt_wrapper_script')
@@ -47,7 +56,7 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
     if os.path.isabs(file_path_or_pattern) or file_path_or_pattern.startswith('/tmp') or file_path_or_pattern.startswith('//'):
         actual_file_path = file_path_or_pattern
     else:
-        actual_file_path = f"{loading_zone}/{file_pattern_clean(file_path_or_pattern)}"
+        actual_file_path = os.path.join(loading_zone, file_path_or_pattern)
                 
     bash_bin = "/bin/bash"
 
@@ -57,7 +66,8 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
         "-t", entity, 
         "-B", str(batch_id),
         "-m", load_mode,
-        "-S", str(skip_rows)
+        "-S", str(skip_rows),
+        "-Y", str(skip_rows_every_file)
     ]
     if extract_timestamp:
         cmd.extend(["-T", str(extract_timestamp)])
@@ -81,7 +91,14 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
     # Build unlock command if script provided
     unlock_cmd = None
     if unlock_script:
-        unlock_cmd = [bash_bin, unlock_script, "-t", entity, "-m", "replace"]
+        unlock_cmd = [
+            bash_bin, unlock_script,
+            "-t", entity,
+            "-m", load_mode,
+            "-B", str(batch_id)
+        ]
+        if extract_timestamp:
+            unlock_cmd.extend(["-T", str(extract_timestamp)])
         if target_db and work_db:
             unlock_cmd.extend([
                 "-d", target_db,
@@ -111,15 +128,16 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
             if unlock_cmd:
                 logger.warning(f"[{entity}] Error 2652 detected. Triggering reactive unlock and retrying...")
                 try:
-                    unlock_res = subprocess.run(unlock_cmd, capture_output=True, text=True, env=tpt_env, timeout=600)
+                    unlock_res = subprocess.run(unlock_cmd, capture_output=True, text=True, errors='replace', env=tpt_env, timeout=600)
                     if unlock_res.returncode in [0, 4] and load_mode == "replace":
                         logger.info(f"[{entity}] Resumed job completed successfully via unlock script.")
                         result = unlock_res
                     else:
-                        result = subprocess.run(cmd, capture_output=True, text=True, env=tpt_env, timeout=timeout_sec) # Retry once
+                        result = subprocess.run(cmd, capture_output=True, text=True, errors='replace', env=tpt_env, timeout=timeout_sec) # Retry once
                 except subprocess.TimeoutExpired:
                     logger.error(f"[{entity}] Reactive unlock or retry timed out.")
-                    db_state.update_task_end(batch_id, entity, 'FAILED', error_msg="Timeout during unlock or retry.")
+                    if db_state:
+                        db_state.update_task_end(batch_id, entity, 'FAILED', error_msg="Timeout during unlock or retry.", source=source)
                     return entity, False
             else:
                 logger.warning(f"[{entity}] Error 2652 detected but no unlock script configured.")
@@ -127,23 +145,23 @@ def run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_conf
         # Exit code 0 or 4 (Warning) are success for TPT
         if result.returncode in [0, 4]:
             logger.info(f"Successfully loaded entity '{entity}'")
-            db_state.update_task_end(batch_id, entity, 'SUCCESS')
+            if db_state:
+                db_state.update_task_end(batch_id, entity, 'SUCCESS', source=source)
             return entity, True
         else:
             err_msg = result.stderr if result.stderr else result.stdout
             logger.error(f"Failed to load entity '{entity}' (RC {result.returncode}). Msg: {err_msg}")
-            db_state.update_task_end(batch_id, entity, 'FAILED', error_msg=err_msg)
+            if db_state:
+                db_state.update_task_end(batch_id, entity, 'FAILED', error_msg=err_msg, source=source)
             return entity, False
             
     except subprocess.TimeoutExpired:
         logger.error(f"[{entity}] TPT execution timed out after {timeout_sec} seconds.")
-        db_state.update_task_end(batch_id, entity, 'FAILED', error_msg=f"TimeoutExpired: Process exceeded {timeout_sec}s limit.")
+        if db_state:
+            db_state.update_task_end(batch_id, entity, 'FAILED', error_msg=f"TimeoutExpired: Process exceeded {timeout_sec}s limit.", source=source)
         return entity, False
     except Exception as e:
         logger.exception(f"Exception while loading entity '{entity}': {e}")
-        db_state.update_task_end(batch_id, entity, 'FAILED', error_msg=str(e))
+        if db_state:
+            db_state.update_task_end(batch_id, entity, 'FAILED', error_msg=str(e), source=source)
         return entity, False
-
-def file_pattern_clean(f):
-    """Returns normalized pattern."""
-    return f

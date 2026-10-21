@@ -35,17 +35,17 @@ DATA_INGESTION_ORCHESTRATOR/
 #### Functions in `orchestrator.py`:
 1. `is_pid_alive(pid: int) -> bool`
    - **Signature**: `is_pid_alive(pid: int) -> bool`
-   - **Description**: Verifies if an OS Process ID is actively running. On POSIX/Linux, executes `os.kill(pid, 0)` with error trapping for dead processes vs permission boundaries. On Windows NT, uses Win32 `kernel32.OpenProcess`.
+   - **Description**: Verifies if an OS Process ID is actively running on POSIX/Linux by executing `os.kill(pid, 0)` with error trapping for dead processes vs permission boundaries.
    - **Return**: `True` if process is active; `False` if dead or non-existent.
 
 2. `strip_header_in_place(file_path: str) -> None`
    - **Signature**: `strip_header_in_place(file_path: str) -> None`
-   - **Description**: Strips line 1 (header) from a delimited text file in-place using a temporary swap file (`.tmp`). Writes a `.<filename>.header_stripped` marker file to guarantee idempotency across task retries.
+   - **Description**: Strips line 1 (header) from a delimited text file in-place using a temporary swap file (`.tmp`). Writes a `.<filename>.header_stripped` marker file after staging the swap file and before `os.replace()` to guarantee crash-safe idempotency across task retries.
    - **Side Effects**: Modifies file in-place; creates hidden marker file.
 
-3. `process_entity_task(entity, entity_info, batch_id, extract_timestamp, tpt_config, orch_config, db) -> bool`
-   - **Signature**: `process_entity_task(entity, entity_info, batch_id, extract_timestamp, tpt_config, orch_config, db) -> bool`
-   - **Description**: ThreadPool worker target. Safely unpacks archives (`.zip` / `.gz`) inside `LOADING_ZONE`, determines single vs multi-chunk structure, applies `strip_header_in_place` on Chunk 1 if multi-chunk delimited text, configures `SkipRows` (0 for normalized multi-chunks, 1 for single files), invokes `run_tpt_loader()`, and returns task success boolean.
+3. `process_entity_task(entity, entity_info, batch_id, extract_timestamp, tpt_config, orch_config, db, source) -> bool`
+   - **Signature**: `process_entity_task(entity, entity_info, batch_id, extract_timestamp, tpt_config, orch_config, db, source) -> bool`
+   - **Description**: ThreadPool worker target. Safely unpacks archives (`.zip` / `.gz`) inside `LOADING_ZONE`, determines single vs multi-chunk structure, applies `strip_header_in_place` on Chunk 1 if multi-chunk delimited text, configures `SkipRows` (0 for normalized multi-chunks, 1 for single files), invokes `run_tpt_loader(..., source=source)`, and returns task success boolean.
 
 4. `expand_env_vars(data: Any) -> Any`
    - **Signature**: `expand_env_vars(data: Any) -> Any`
@@ -98,15 +98,15 @@ DATA_INGESTION_ORCHESTRATOR/
 #### Class: `TeradataStateDB`
 1. `__init__(td_config: dict)`: Resolves host, user, encrypted password (`Key`/`Pass` files or `TD_PASSWORD`), logmech, and technical database name.
 2. `get_connection() -> teradatasql.TeradataConnection`: Establishes Teradata connection.
-3. `initialize_batch(batch_id, source, extract_timestamp, tasks_list) -> None`: Inserts or updates a row in `BATCH_RUNS` with `STATUS = 'RUNNING'` and `PROCESS_PID = os.getpid()`. Inserts task records in `BATCH_TASKS` as `PENDING`. Formats dates strictly to `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` to avoid Teradata Error 5404.
-4. `get_pending_tasks(batch_id, source=None) -> List[Tuple]`: Returns list of `(ENTITY_NAME, FILE_NAME, RETRY_COUNT)` for `PENDING` or `FAILED` tasks.
-5. `update_task_start(batch_id, entity_name, file_name=None, source=None)`: Commits task status as `RUNNING` with current timestamp.
-6. `update_task_success(batch_id, entity_name, file_name=None, source=None)`: Commits task status as `SUCCESS` with end timestamp.
-7. `update_task_failure(batch_id, entity_name, error_msg, file_name=None, source=None)`: Increments `RETRY_COUNT`, records error message, and sets status to `FAILED`.
-8. `get_batch_summary(batch_id, expected_total_files, source=None) -> bool`: Returns `True` if `COUNT(*) WHERE STATUS = 'SUCCESS'` equals expected files count.
-9. `finish_batch(batch_id, final_status, source=None)`: Updates `BATCH_RUNS` status (`SUCCESS` or `FAILED`) and commits `END_TIME` while permanently preserving `PROCESS_PID`.
-10. `get_active_batch_run(source=None) -> Optional[Dict]`: Queries for any batch with `STATUS = 'RUNNING'` (optionally filtered by source), returning `BATCH_ID`, `SOURCE`, `EXTRACT_TIMESTAMP`, and `PROCESS_PID`.
-11. `mark_batch_failed(batch_id, source=None)`: Auto-heals orphaned batches by setting `STATUS = 'FAILED'`.
+3. `_require_source(source: str) -> str`: Enforces that `source` is a non-empty string (`ValueError` raised if missing) so all `BATCH_RUNS` and `BATCH_TASKS` queries use the composite `(BATCH_ID, SOURCE)` primary index.
+4. `initialize_batch(batch_id, source, extract_timestamp, tasks_list) -> None`: Inserts or updates a row in `BATCH_RUNS` with `STATUS = 'RUNNING'` and `PROCESS_PID = os.getpid()`. Inserts task records in `BATCH_TASKS` as `PENDING`. Formats dates strictly to `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` to avoid Teradata Error 5404.
+5. `get_pending_tasks(batch_id, source) -> List[Tuple]`: Returns list of `(ENTITY_NAME, FILE_NAME, RETRY_COUNT)` for `PENDING` or `FAILED` tasks scoped by `BATCH_ID` and `SOURCE`.
+6. `update_task_start(batch_id, entity_name, file_name=None, source=None)`: Commits task status as `RUNNING` with current timestamp (requires `source`).
+7. `update_task_end(batch_id, entity_name, status, retry_count, error_message, file_name=None, source=None)`: Updates `STATUS` (`SUCCESS` or `FAILED`), `RETRY_COUNT`, `END_TIME`, and `ERROR_MESSAGE` (truncated to 1000 characters; requires `source`).
+8. `get_batch_summary(batch_id, expected_total_files, source) -> bool`: Returns `True` if `COUNT(*) WHERE BATCH_ID = ? AND SOURCE = ? AND STATUS = 'SUCCESS'` equals expected files count.
+9. `finish_batch(batch_id, final_status, source)`: Updates `BATCH_RUNS` status (`SUCCESS` or `FAILED`) and commits `END_TIME` while permanently preserving `PROCESS_PID` (requires `source`).
+10. `get_active_batch_run(source=None) -> Optional[Dict]`: Queries for any batch with `STATUS = 'RUNNING'` (filtered by `SOURCE` when provided), returning `BATCH_ID`, `SOURCE`, `EXTRACT_TIMESTAMP`, and `PROCESS_PID`.
+11. `mark_batch_failed(batch_id, source)`: Auto-heals orphaned batches by setting `STATUS = 'FAILED'` (requires `source`).
 
 ---
 
@@ -115,11 +115,11 @@ DATA_INGESTION_ORCHESTRATOR/
 - **Role**: Subprocess execution of `load_csv_generic.sh` with auto-healing and pre-emptive table unlocking.
 
 #### Functions in `lib/tpt_worker.py`:
-1. `run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, ...) -> Tuple[int, bool]`
-   - **Description**: Dispatches `TPT_LOADER/load_csv_generic.sh`.
+1. `run_tpt_loader(entity, file_path_or_pattern, retry_count, batch_id, tpt_config, orch_config, db_state, extract_timestamp=None, skip_rows=1, skip_rows_every_file="N", delimiter=",", source=None) -> Tuple[int, bool]`
+   - **Description**: Dispatches `TPT_LOADER/load_csv_generic.sh` forwarding `-S <skip_rows>`, `-Y <skip_rows_every_file>`, `-s <delimiter>`, `-B <batch_id>`, and `-T <extract_timestamp>`, and records task state transitions with mandatory `source` scoping.
    - **Auto-Healing**:
-     - On retry ($>0$), issues a pre-emptive unlock via `unlock_tpt_table.sh`.
-     - Intercepts return code `3` or output containing Error `2652` (`Table is being Loaded / Paused`), executes reactive unlock, and retries.
+     - On retry ($>0$), issues a pre-emptive unlock via `unlock_tpt_table.sh -t <entity> -m <load_mode> -B <batch_id> -T <extract_timestamp>`.
+     - Intercepts return code `3` or output containing Error `2652` (`Table is being Loaded / Paused`), executes reactive unlock with `-m <load_mode> -B <batch_id> -T <extract_timestamp>`, and retries.
      - Safely replaces non-UTF8 characters in output streams (`errors='replace'`).
 
 ---

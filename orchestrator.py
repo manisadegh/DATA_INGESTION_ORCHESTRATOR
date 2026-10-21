@@ -12,29 +12,16 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def is_pid_alive(pid: int) -> bool:
-    """Checks if a given process ID is actively running."""
+    """Checks if a given process ID is actively running (POSIX)."""
     if pid <= 0:
         return False
-    if os.name == 'nt':
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            SYNCHRONIZE = 0x00100000
-            process = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
-            if process != 0:
-                kernel32.CloseHandle(process)
-                return True
-            return False
-        except Exception:
-            return False
-    else:
-        try:
-            os.kill(pid, 0)
-            return True
-        except (OSError, ProcessLookupError):
-            return False
-        except PermissionError:
-            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
 
 from lib.logger import setup_logger, add_batch_file_logger
 from lib.db_state import TeradataStateDB
@@ -50,24 +37,27 @@ from lib.post_tasks import run_post_tasks
 def strip_header_in_place(file_path):
     """
     Removes the header (first line) of a CSV file in-place (Solution A).
-    Leaves a marker file to ensure it is never stripped more than once on retries.
+    Writes the marker file after staging the stripped content to temp_path
+    so a crash can never strip line 1 twice on retry.
     """
     marker = os.path.join(os.path.dirname(file_path), "." + os.path.basename(file_path) + ".header_stripped")
+    temp_path = file_path + ".tmp"
     if os.path.exists(marker):
+        if os.path.exists(temp_path):
+            os.replace(temp_path, file_path)
         return
         
-    temp_path = file_path + ".tmp"
     with open(file_path, 'r', encoding='utf-8', errors='replace') as fin, \
          open(temp_path, 'w', encoding='utf-8') as fout:
         _ = fin.readline() # Strip header line
         for line in fin:
             fout.write(line)
             
-    os.replace(temp_path, file_path)
-    with open(marker, 'w') as f:
+    with open(marker, 'w', encoding='utf-8') as f:
         f.write("STRIPPED\n")
+    os.replace(temp_path, file_path)
 
-def process_entity_task(entity, entity_info, batch_id, extract_timestamp, tpt_config, orch_config, db):
+def process_entity_task(entity, entity_info, batch_id, source, extract_timestamp, tpt_config, orch_config, db):
     """
     Ingests all files for a given entity in the isolated LOADING_ZONE.
     Handles single files vs multi-chunk extracts and header normalization.
@@ -76,10 +66,9 @@ def process_entity_task(entity, entity_info, batch_id, extract_timestamp, tpt_co
     loading_zone = orch_config.get('loading_zone', orch_config['landing_zone'])
     files = sorted(entity_info['files'])
     signature = entity_info.get('signature', entity.lower())
-    extension = entity_info.get('extension', '.csv')
     
-    # Check max retry count for this entity
-    pending_tasks = db.get_pending_tasks(batch_id)
+    # Check max retry count for this entity (scoped to source)
+    pending_tasks = db.get_pending_tasks(batch_id, source=source)
     entity_retries = [t[2] for t in pending_tasks if t[0] == entity]
     retry_count = max(entity_retries) if entity_retries else 0
     
@@ -161,7 +150,8 @@ def process_entity_task(entity, entity_info, batch_id, extract_timestamp, tpt_co
         load_mode=load_mode,
         skip_rows=skip_rows,
         skip_rows_every_file=skip_rows_every_file,
-        extract_timestamp=extract_timestamp
+        extract_timestamp=extract_timestamp,
+        source=source
     )
     
     return success
@@ -231,16 +221,9 @@ def main():
         orch_config['archive_zone'] = archive_zone
         orch_config['logs_dir'] = logs_dir
 
-    for key in ['wrapper_script', 'unlock_script', 'work_dir']:
+    for key in ['wrapper_script', 'unlock_script']:
         if tpt_config.get(key) and not os.path.isabs(tpt_config[key]):
             tpt_config[key] = os.path.normpath(os.path.join(base_dir, tpt_config[key]))
-
-    for key in ['tpt_work_dir']:
-        if orch_config.get(key) and not os.path.isabs(orch_config[key]):
-            orch_config[key] = os.path.normpath(os.path.join(base_dir, orch_config[key]))
-
-    if args.source and tpt_config.get('work_dir'):
-        tpt_config['work_dir'] = os.path.join(tpt_config['work_dir'], args.source)
 
     mapping_file = orch_config.get('entity_mapping_file', 'entity_mapping.csv')
     if not os.path.isabs(mapping_file):
@@ -343,25 +326,6 @@ def main():
         if f.endswith('.MF')
     ] if os.path.exists(loading_zone) else []
 
-    # Fallback to parent LOADING_ZONE if placed before partitioning
-    if not in_flight_manifests and args.source:
-        parent_lz = os.path.dirname(loading_zone)
-        if os.path.exists(parent_lz):
-            parent_mfs = [
-                os.path.join(parent_lz, f)
-                for f in os.listdir(parent_lz)
-                if f.endswith('.MF') and (not args.source or args.source.lower() in f.lower())
-            ]
-            if len(parent_mfs) == 1:
-                p_mf = parent_mfs[0]
-                p_mf_name = os.path.basename(p_mf)
-                shutil.move(p_mf, os.path.join(loading_zone, p_mf_name))
-                for f in os.listdir(parent_lz):
-                    f_path = os.path.join(parent_lz, f)
-                    if os.path.isfile(f_path):
-                        shutil.move(f_path, os.path.join(loading_zone, f))
-                in_flight_manifests = [os.path.join(loading_zone, p_mf_name)]
-
     if in_flight_manifests:
         logger.info(f"In-flight batch detected in LOADING_ZONE: {in_flight_manifests[0]}. Resuming execution.")
         manifest_path = in_flight_manifests[0]
@@ -371,20 +335,6 @@ def main():
         active_zone = landing_zone
         is_in_flight = False
         scan_status, manifest_path, data_files = scan_landing_zone(landing_zone, manifest_pattern)
-
-        # Fallback check on parent landing_zone if empty in partition
-        if scan_status == "IDLE" and args.source:
-            parent_landing = os.path.dirname(landing_zone)
-            if os.path.exists(parent_landing):
-                p_status, p_mf, p_files = scan_landing_zone(parent_landing, manifest_pattern)
-                if p_status == "VALID" and (not args.source or args.source.lower() in p_mf.lower()):
-                    p_mf_name = os.path.basename(p_mf)
-                    shutil.move(p_mf, os.path.join(landing_zone, p_mf_name))
-                    for f in p_files:
-                        src_f = os.path.join(parent_landing, f)
-                        if os.path.isfile(src_f):
-                            shutil.move(src_f, os.path.join(landing_zone, f))
-                    scan_status, manifest_path, data_files = scan_landing_zone(landing_zone, manifest_pattern)
         
         if scan_status == "IDLE":
             logger.info("Landing zone is empty. Exiting gracefully with RC 0.")
@@ -493,7 +443,7 @@ def main():
             futures = {}
             for entity in pending_entities:
                 entity_info = entities_workload[entity]
-                futures[executor.submit(process_entity_task, entity, entity_info, batch_id, extract_ts, tpt_config, orch_config, db)] = entity
+                futures[executor.submit(process_entity_task, entity, entity_info, batch_id, source, extract_ts, tpt_config, orch_config, db)] = entity
                 
             for future in as_completed(futures):
                 entity = futures[future]
