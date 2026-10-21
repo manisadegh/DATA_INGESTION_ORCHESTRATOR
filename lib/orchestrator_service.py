@@ -719,6 +719,14 @@ class OrchestratorService:
             for fname in info["files"]:
                 tasks_list.append((entity, fname))
 
+        if not tasks_list and ctx.validated_files:
+            msg = (
+                f"FATAL: No tasks generated for batch {ctx.batch_id} despite "
+                f"{len(ctx.validated_files)} validated data files present in active zone."
+            )
+            self.logger.critical(msg)
+            raise DataLoaderError(msg)
+
         try:
             db.initialize_batch(ctx.batch_id, ctx.source, ctx.extract_ts, tasks_list)
         except Exception as exc:

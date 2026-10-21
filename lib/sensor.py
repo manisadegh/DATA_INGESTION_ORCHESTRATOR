@@ -395,7 +395,7 @@ def verify_descriptor_batch(
     entities_workload: Dict[str, Dict[str, Any]] = {}
 
     for target_table, entity_info in descriptor.entities.items():
-        raw_files = entity_info.get("files", [])
+        raw_files = entity_info.get("files") or entity_info.get("data_files") or []
         if not raw_files:
             continue
 
