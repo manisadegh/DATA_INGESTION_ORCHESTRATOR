@@ -345,13 +345,12 @@ class OrchestratorService:
         self.lock_timeout = concurrency_cfg.get("lock_timeout_seconds", 7200)
 
         # Schema Guard settings
-        self.schema_guard_enabled = bool(
-            self.schema_guard_cfg.get("enabled", True) if "schema_guard" in self.config else False
-        )
+        self.schema_guard_enabled = bool(self.schema_guard_cfg.get("enabled", True))
         # Check environment variable override DL_AUTO_MIGRATE_DDL
         env_auto_migrate = os.environ.get("DL_AUTO_MIGRATE_DDL")
         if env_auto_migrate is not None:
             self.auto_migrate_ddl = env_auto_migrate.strip().lower() in ("1", "true", "yes")
+            self.schema_guard_enabled = True
         else:
             self.auto_migrate_ddl = bool(self.schema_guard_cfg.get("auto_migrate_ddl", True))
 
@@ -680,6 +679,8 @@ class OrchestratorService:
         if not sample_path and entity_info.get("files"):
             sample_path = os.path.join(self.loading_zone, entity_info["files"][0])
 
+        entity_load_mode = entity_info.get("load_mode", "replace")
+
         try:
             with db.get_connection() as conn:
                 res = sync_entity_schema_if_drifted(
@@ -690,7 +691,7 @@ class OrchestratorService:
                     default_type=self.default_column_type,
                     character_set=self.character_set,
                     auto_migrate_ddl=self.auto_migrate_ddl,
-                    load_mode="replace",
+                    load_mode=entity_load_mode,
                     csv_cols=csv_cols,
                 )
                 if len(res) >= 4:

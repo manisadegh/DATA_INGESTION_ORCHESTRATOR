@@ -5,6 +5,13 @@
     "logmech": "TD2",
     "technical_database": "${TDENV}SIDFINTCH"
   },
+  "schema_guard": {
+    "enabled": true,
+    "auto_migrate_ddl": true,
+    "default_column_type": "VARCHAR(4000)",
+    "character_set": "UNICODE",
+    "target_database": "${TDENV}SIDFINSTG"
+  },
   "tpt": {
     "wrapper_script": "../TPT_LOADER/load_csv_generic.sh",
     "unlock_script": "../TPT_LOADER/unlock_tpt_table.sh",
