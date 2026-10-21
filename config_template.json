@@ -3,7 +3,8 @@
     "host": "${TDPID}",
     "user": "${TDENV}${SID_ADM_USER}",
     "logmech": "TD2",
-    "technical_database": "${TDENV}SIDFINTCH"
+    "technical_database": "${TDENV}SIDFINTCH",
+    "connection_pool_size": 6
   },
   "tpt": {
     "wrapper_script": "../TPT_LOADER/load_csv_generic.sh",

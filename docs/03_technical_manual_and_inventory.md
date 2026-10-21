@@ -10,62 +10,53 @@ It controls the atomic ingress, decompression, header normalization, and paralle
 
 ```
 DATA_INGESTION_ORCHESTRATOR/
-├── orchestrator.py             # Master orchestrator entrypoint & concurrency sentry
+├── orchestrator.py             # Thin CLI entrypoint (<80 lines) delegating to OrchestratorService
 ├── config.json                 # Deployment configuration file
-├── config_template.json        # Template configuration with concurrency defaults
+├── config_template.json        # Template configuration with concurrency & pool defaults
 ├── entity_mapping.csv          # Entity-to-table signature mapping definitions
 ├── ddl_technical_tables.sql    # Teradata DDL for BATCH_RUNS & BATCH_TASKS
 ├── docs/                       # Technical and operational documentation suite
 └── lib/
+    ├── orchestrator_service.py # OrchestratorService & BatchContext (imports dataloader_core)
     ├── sensor.py               # Landing zone discovery, gating & checksum verification
-    ├── db_state.py             # Teradata state persistence (BATCH_RUNS / TASKS)
+    ├── db_state.py             # Pooled Teradata state persistence (BATCH_RUNS / TASKS)
     ├── tpt_worker.py           # Subprocess execution & Error 2652 reactive lock recovery
-    ├── post_tasks.py           # Source and global post-task execution engine
-    └── logger.py               # Batch log capsule and execution logging setup
+    ├── post_tasks.py           # Source and global post-task execution engine (context_env)
+    └── logger.py               # Batch log capsule and execution logging wrapper
 ```
 
 ---
 
 ## 2. Module Inventory & Code Signatures
 
-### 2.1 Entrypoint: `orchestrator.py`
-- **Path**: `orchestrator.py`
-- **Role**: Master batch ingress controller, concurrency driver, archive manager.
+### 2.1 CLI Entrypoint (`orchestrator.py`) & Service (`lib/orchestrator_service.py`)
+- **Paths**: `orchestrator.py`, `lib/orchestrator_service.py`
+- **Role**: Thin CLI entrypoint (`orchestrator.py`) and cohesive service class (`OrchestratorService`) backed by `COMMON/dataloader_core` (`ConfigLoader`, `ProcessLock`, `TeradataConnectionManager`, `EntityMapper`, `ManifestHandler`, `CapsulePathResolver`, `LoggingFactory`).
 
-#### Functions in `orchestrator.py`:
-1. `is_pid_alive(pid: int) -> bool`
-   - **Signature**: `is_pid_alive(pid: int) -> bool`
-   - **Description**: Verifies if an OS Process ID is actively running on POSIX/Linux by executing `os.kill(pid, 0)` with error trapping for dead processes vs permission boundaries.
-   - **Return**: `True` if process is active; `False` if dead or non-existent.
-
-2. `strip_header_in_place(file_path: str) -> None`
-   - **Signature**: `strip_header_in_place(file_path: str) -> None`
+#### Class `OrchestratorService` & Helpers (`lib/orchestrator_service.py`):
+1. `strip_header_in_place(file_path: str) -> None`
    - **Description**: Strips line 1 (header) from a delimited text file in-place using a temporary swap file (`.tmp`). Writes a `.<filename>.header_stripped` marker file after staging the swap file and before `os.replace()` to guarantee crash-safe idempotency across task retries.
-   - **Side Effects**: Modifies file in-place; creates hidden marker file.
 
-3. `process_entity_task(entity, entity_info, batch_id, extract_timestamp, tpt_config, orch_config, db, source) -> bool`
-   - **Signature**: `process_entity_task(entity, entity_info, batch_id, extract_timestamp, tpt_config, orch_config, db, source) -> bool`
-   - **Description**: ThreadPool worker target. Safely unpacks archives (`.zip` / `.gz`) inside `LOADING_ZONE`, determines single vs multi-chunk structure, applies `strip_header_in_place` on Chunk 1 if multi-chunk delimited text, configures `SkipRows` (0 for normalized multi-chunks, 1 for single files), invokes `run_tpt_loader(..., source=source)`, and returns task success boolean.
+2. `process_entity_task(entity, entity_info, batch_id, source, extract_timestamp, tpt_config, orch_config, db) -> bool`
+   - **Description**: ThreadPool worker target. Safely unpacks archives (`.zip` / `.gz`) inside `LOADING_ZONE`, determines single vs multi-chunk structure, applies `strip_header_in_place` on Chunk 1 if multi-chunk delimited text, configures `SkipRows` (`0` for normalized multi-chunks, `1` for single files), invokes `run_tpt_loader(..., source=source)`, and returns task success boolean.
 
-4. `expand_env_vars(data: Any) -> Any`
-   - **Signature**: `expand_env_vars(data: Any) -> Any`
-   - **Description**: Recursively expands `${VAR}` or `$VAR` environment variables in configuration strings, dictionaries, and lists.
+3. `OrchestratorService.wait_or_recover_active_db_batch() -> None`
+   - **Description**: Queries `BATCH_RUNS` via `db.get_active_batch_run(source)`. Waits via `wait_for_pid_completion()` if `PROCESS_PID` is alive, or reclassifies orphaned batches as `FAILED` if `PROCESS_PID` is dead.
 
-5. `main() -> None`
-   - **Signature**: `main() -> None`
-   - **Execution Sequence**:
-     1. **Configuration & Paths**: Loads `config.json`, resolves relative paths, applies `--source` partition overrides to `LANDING_ZONE`, `LOADING_ZONE`, `ARCHIVE_ZONE`, and `LOGS`.
-     2. **Teradata Pre-Flight Check**: Queries `BATCH_RUNS` for active batches of this source (`get_active_batch_run(source)`). If active PID is alive, enters active polling wait loop (`poll_interval_seconds: 5`). If PID is dead, reclassifies orphaned batch as `FAILED` (`mark_batch_failed`).
-     3. **Process Lock Sentry**: Inspects `LOADING_ZONE/<SOURCE>/.orchestrator.pid`. If an active PID is alive, polls until completion. Acquires lock and registers `atexit` cleanup.
-     4. **In-Flight Crash Check**: Inspects `LOADING_ZONE/<SOURCE>` for uncompleted `.MF`. If found, activates crash recovery (`is_in_flight = True`), bypassing checksum validation and resuming remaining tasks.
-     5. **Landing Zone Gating**: If no in-flight batch, scans `LANDING_ZONE/<SOURCE>` via `scan_landing_zone()`. Enforces single-batch invariant (OPS-01) and orphan-free integrity.
-     6. **Batch Log Capsule Setup**: Creates `LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/` and sets `tpt_config['work_dir'] = .../TPT/`.
-     7. **Payload Validation & Move**: Validates checksums, maps files to entities (`verify_and_map_batch`), and moves payload files from `LANDING_ZONE` to `LOADING_ZONE`.
-     8. **State Initialization**: Inserts or updates batch in `BATCH_RUNS` (`STATUS = 'RUNNING'`, records `PROCESS_PID`), and registers all entity files in `BATCH_TASKS` as `PENDING`.
-     9. **Parallel Worker Dispatch**: Executes entity tasks in parallel via `ThreadPoolExecutor(max_workers=max_concurrent_jobs)`.
-     10. **Completeness Barrier**: Verifies that 100% of expected entity files succeeded. If any task failed after maximum retries, marks `BATCH_RUNS` as `FAILED` and aborts.
-     11. **Post-Tasks Execution**: Merges source-specific tasks (`--post-tasks-file`) with global tasks and executes them synchronously.
-     12. **Archiving & Final Commit**: Moves data payload and manifest to `ARCHIVE_ZONE/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/`, cleans temporary markers, updates `BATCH_RUNS` to `SUCCESS` (permanently retaining `PROCESS_PID`), and removes `.orchestrator.pid`.
+4. `OrchestratorService.detect_and_validate_batch() -> Optional[BatchContext]`
+   - **Description**: Detects in-flight batches in `LOADING_ZONE` or scans `LANDING_ZONE` under Single-Batch rules (`OPS-01`), sets up Batch Capsule logging via `CapsulePathResolver.get_log_capsule_dir()`, and validates checksums and entity mappings (`verify_and_map_batch`). Returns `None` when `IDLE`.
+
+5. `OrchestratorService.transition_to_loading_zone(ctx: BatchContext) -> None`
+   - **Description**: Moves manifest and validated payload files atomically from `LANDING_ZONE` to `LOADING_ZONE`.
+
+6. `OrchestratorService.execute_entity_tasks(ctx: BatchContext) -> bool`
+   - **Description**: Registers batch in `BATCH_RUNS`/`BATCH_TASKS` and dispatches entity workers concurrently via `ThreadPoolExecutor` sharing pooled connections from `TeradataStateDB`.
+
+7. `OrchestratorService.run_completeness_barrier_and_archive(ctx: BatchContext) -> int`
+   - **Description**: Verifies 100% task completion in `BATCH_TASKS`, executes post-ingestion tasks passing `context_env` (`CURRENT_BATCH_ID`, `CURRENT_SOURCE`, `CURRENT_MANIFEST`) without mutating global `os.environ`, archives deliverables into `ARCHIVE_ZONE/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/`, cleans `LOADING_ZONE`, and marks `BATCH_RUNS` as `SUCCESS`.
+
+8. `OrchestratorService.run(skip_post_tasks: Optional[bool] = None, post_tasks_file: Optional[str] = None) -> int`
+   - **Description**: Acquires `dataloader_core.locking.ProcessLock` (`fcntl.flock` + PID tracking) on `LOADING_ZONE/<SOURCE>/.orchestrator.pid`, executes all lifecycle phases, and closes all pooled Teradata connections in `finally`.
 
 ---
 
@@ -93,11 +84,12 @@ DATA_INGESTION_ORCHESTRATOR/
 
 ### 2.3 Module: `lib/db_state.py`
 - **Path**: `lib/db_state.py`
-- **Role**: State persistence in Teradata Vantage (`BATCH_RUNS` and `BATCH_TASKS`).
+- **Role**: State persistence in Teradata Vantage (`BATCH_RUNS` and `BATCH_TASKS`) backed by `dataloader_core.db.TeradataConnectionManager` connection pooling.
 
 #### Class: `TeradataStateDB`
-1. `__init__(td_config: dict)`: Resolves host, user, encrypted password (`Key`/`Pass` files or `TD_PASSWORD`), logmech, and technical database name.
-2. `get_connection() -> teradatasql.TeradataConnection`: Establishes Teradata connection.
+1. `__init__(td_config: dict, conn_mgr: Optional[TeradataConnectionManager] = None)`: Instantiates or accepts a `TeradataConnectionManager` pool (default `connection_pool_size = 6`) and validates `technical_database` via `validate_sql_identifier`.
+2. `get_connection() -> ContextManager[teradatasql.TeradataConnection]`: Borrows a live pooled connection from `self.conn_mgr.acquire_connection()`, returning it to the pool on exit without closing the TCP session.
+3. `close() -> None`: Closes all pooled Teradata connections at orchestrator shutdown.
 3. `_require_source(source: str) -> str`: Enforces that `source` is a non-empty string (`ValueError` raised if missing) so all `BATCH_RUNS` and `BATCH_TASKS` queries use the composite `(BATCH_ID, SOURCE)` primary index.
 4. `initialize_batch(batch_id, source, extract_timestamp, tasks_list) -> None`: Inserts or updates a row in `BATCH_RUNS` with `STATUS = 'RUNNING'` and `PROCESS_PID = os.getpid()`. Inserts task records in `BATCH_TASKS` as `PENDING`. Formats dates strictly to `YYYY-MM-DD` and `YYYY-MM-DD HH:MM:SS` to avoid Teradata Error 5404.
 5. `get_pending_tasks(batch_id, source) -> List[Tuple]`: Returns list of `(ENTITY_NAME, FILE_NAME, RETRY_COUNT)` for `PENDING` or `FAILED` tasks scoped by `BATCH_ID` and `SOURCE`.
@@ -129,9 +121,9 @@ DATA_INGESTION_ORCHESTRATOR/
 - **Role**: Post-ingestion task execution engine.
 
 #### Functions in `lib/post_tasks.py`:
-1. `run_post_tasks(post_tasks_config: list, batch_id: str, source: str, extract_timestamp: str, ...) -> bool`
-   - **Description**: Merges source-specific tasks (loaded from `--post-tasks-file`) with global tasks from `config.json`.
-   - **Variable Injection**: Automatically exports `$CURRENT_BATCH_ID`, `$CURRENT_SOURCE`, and `$CURRENT_EXTRACT_TIMESTAMP` into subprocess environments.
+1. `run_post_tasks(post_tasks_config: list, context_env: Optional[Dict[str, str]] = None) -> bool`
+   - **Description**: Executes source-specific and global post-ingestion hooks (`dbt`, `shell`, `python`).
+   - **Isolated Environment Injection**: Merges `context_env` (`CURRENT_BATCH_ID`, `CURRENT_SOURCE`, `CURRENT_MANIFEST`) into a subprocess environment dictionary without mutating global `os.environ`.
 
 ---
 
