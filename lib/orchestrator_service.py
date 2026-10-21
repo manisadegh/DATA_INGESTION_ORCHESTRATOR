@@ -37,7 +37,11 @@ from dataloader_core.exceptions import (
     SchemaSyncError,
 )
 from dataloader_core.locking import ProcessLock, is_pid_alive, wait_for_pid_completion
-from dataloader_core.logging_utils import add_batch_file_logger, setup_orchestrator_console_logger
+from dataloader_core.logging_utils import (
+    add_batch_file_logger,
+    detach_batch_file_logger,
+    setup_orchestrator_console_logger,
+)
 
 from lib.db_state import TeradataStateDB
 from lib.post_tasks import run_post_tasks
@@ -864,6 +868,7 @@ class OrchestratorService:
 
         db.finish_batch(ctx.batch_id, "SUCCESS", source=ctx.source)
         self.logger.info(f"[SUCCESS] Pipeline completed successfully for batch {ctx.batch_id}!")
+        detach_batch_file_logger(self.logger)
         return 0
 
     finalize_and_archive = run_completeness_barrier_and_archive
@@ -956,5 +961,6 @@ class OrchestratorService:
             self.logger.critical(f"FATAL: Unhandled exception in Orchestrator: {exc}")
             return 1
         finally:
+            detach_batch_file_logger(self.logger)
             if self.db is not None:
                 self.db.close()
