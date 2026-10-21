@@ -206,6 +206,34 @@ cp /sg/local/sid/home/Dsidadm/DATA_LOADER/CONFIG/entity_mapping.csv "${ORCH_TEST
 
 ---
 
+### Test Case: TC-ORCH-13 (Teradata DB, Storage & PID Audit via verify_database_and_storage.py)
+- **Objective**: Perform automated deep verification of Teradata technical state (`BATCH_RUNS`, `BATCH_TASKS`, `PROCESS_PID` preservation), staging table data, and storage lifecycles.
+- **Procedure**:
+  ```bash
+  # Standard audit (nominal batch with 3 rows)
+  python3 ../../TESTS/verify_database_and_storage.py \
+      --batch-id "9007" \
+      --source "ORACLE_FUSION" \
+      --target-table "ERP_MSH_USER" \
+      --expected-count 3 \
+      --output-file "audit_batch_9007.txt"
+
+  # Multi-batch queue audit (superseded batch in replace mode)
+  python3 ../../TESTS/verify_database_and_storage.py \
+      --batch-id "9002" \
+      --source "ORACLE_FUSION" \
+      --target-table "ERP_MSH_USER" \
+      --skip-staging-check \
+      --output-file "audit_batch_9002.txt"
+  ```
+- **Assertions**:
+  - `BATCH_RUNS`: `STATUS = 'SUCCESS'`, `END_TIME IS NOT NULL`, and `PROCESS_PID` is **NOT NULL** (audit preservation confirmed).
+  - `BATCH_TASKS`: All tasks recorded with `STATUS = 'SUCCESS'` and `ERROR_MESSAGE IS NULL`.
+  - Storage: `LANDING_ZONE` clean, `LOADING_ZONE` clean, and `ARCHIVE_ZONE` contains complete Batch Capsule with `batch_descriptor.json` and `RAW/RECEIPT_*.json`.
+  - Staging Table: Row count matches expected count, `INFA_BATCH_ID` matches batch ID, and `INFA_LAST_REPLICATED` is populated (or skipped cleanly when `--skip-staging-check` is specified).
+
+---
+
 ## 5. Automated Regression Test Script
 
 ```bash
