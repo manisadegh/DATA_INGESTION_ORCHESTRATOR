@@ -32,34 +32,49 @@ DATA_INGESTION_ORCHESTRATOR/
 
 ### 2.1 CLI Entrypoint (`orchestrator.py`) & Service (`lib/orchestrator_service.py`)
 - **Paths**: `orchestrator.py`, `lib/orchestrator_service.py`
-- **Role**: Thin CLI entrypoint (`orchestrator.py`) and cohesive service class (`OrchestratorService`) backed by `COMMON/dataloader_core` (`ConfigLoader`, `ProcessLock`, `TeradataConnectionManager`, `EntityMapper`, `ManifestHandler`, `CapsulePathResolver`, `LoggingFactory`, `detach_batch_file_logger`).
+- **Role**: Thin CLI entrypoint (`orchestrator.py`, strictly $<80$ lines) and cohesive service class (`OrchestratorService`) backed by `COMMON/dataloader_core` (`ConfigLoader`, `ProcessLock`, `UtilitySlotGovernor`, `TeradataConnectionManager`, `EntityMapper`, `ManifestHandler`, `CapsulePathResolver`, `LoggingFactory`, `detach_batch_file_logger`).
+
+#### CLI Arguments (`orchestrator.py`):
+- `--config <path>`: Path to JSON configuration file (required).
+- `--skip-post-tasks`: Flag to bypass all post-ingestion tasks.
+- `--source <source>`: Specific source partition code (e.g., `ORACLE_FUSION`, `CRM`).
+- `--sources <S1,S2,...>`: Comma-separated list of sources to process sequentially.
+- `--all-sources`: Scans `LANDING_ZONE` and automatically sweeps all discovered source partitions.
+- `--post-tasks-file <path>`: External JSON file with supplementary post-tasks.
 
 #### Data Structure `BatchContext`:
-Stores metadata for an active batch in the pipeline:
-- `batch_id: str`
-- `source: str`
-- `extract_timestamp: str`
-- `manifest_path: str`
-- `data_files: List[str]`
-- `capsule_dir: Optional[str]`
-- `descriptor: Optional[Dict[str, Any]]`
-- `is_in_flight: bool = False`
+Stores metadata and workload for an active batch in the pipeline:
+- `batch_id: str`: Extracted batch identifier.
+- `source: str`: Source system partition code.
+- `extract_ts: str`: Formatted extract timestamp (`YYYY-MM-DD HH:MM:SS`).
+- `clean_ts: str`: Normalized alphanumeric timestamp token (`YYYYMMDD_HHMMSS`).
+- `manifest_path: str`: Full path to standardized manifest.
+- `manifest_basename: str`: Basename of manifest file.
+- `active_zone: str`: Working processing directory (`LOADING_ZONE/<SOURCE>`).
+- `is_in_flight: bool`: `True` if batch was resumed from an in-flight crash.
+- `entities_workload: Dict[str, Dict[str, Any]]`: Per-entity workload dictionary containing `target_table`, `signature`, `files`, `delimiter`, `load_mode`, `skip_rows`, `header_mode`, and pre-extracted `header_columns`.
+- `validated_files: List[str]`: Full list of validated payload data files.
+- `batch_log_dir: str`: Directory for batch-specific log capsule (`LOGS/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/`).
+- `run_log_file: str`: Path to execution log file.
+- `raw_dir: Optional[str]`: Path to capsule `RAW/` directory containing vaulted raw manifest and intake receipt.
+- `descriptor_path: Optional[str]`: Path to `batch_descriptor.json`.
+- `descriptor: Optional[BatchDescriptor]`: Parsed `BatchDescriptor` object.
 
 #### Class `OrchestratorService` & Key Methods (`lib/orchestrator_service.py`):
 1. `strip_header_in_place(file_path: str) -> None`
    - **Description**: Strips line 1 (header) from a delimited text file in-place using a temporary swap file (`.tmp`). Writes a `.<filename>.header_stripped` marker file after staging the swap file and before `os.replace()` to guarantee crash-safe idempotency across task retries.
 
-2. `process_entity_task(entity, entity_info, batch_id, source, extract_timestamp, tpt_config, orch_config, db, schema_guard) -> bool`
-   - **Description**: ThreadPool worker target. Inspects CSV headers, invokes JIT `schema_guard.sync_entity_schema_if_drifted()`, configures `skip_rows`, `skip_rows_every_file`, and `delimiter` according to entity mapping rule (`header_mode` and custom `delimiter`), acquires a Teradata load slot via `slot_governor.slot()`, invokes `run_tpt_loader(..., delimiter=delimiter, skip_precheck=True, has_meta=2)`, and returns task success boolean.
+2. `process_entity_task(entity, entity_info, batch_id, source, extract_timestamp, tpt_config, orch_config, db, has_meta=2, skip_precheck=True) -> bool`
+   - **Description**: ThreadPool worker target. Extracts entity mapping attributes (`delimiter`, `load_mode`, `skip_rows`, `header_mode`), dearchives `.zip`/`.gz` payloads into `LOADING_ZONE`, configures `SkipRows` and `SkipRowsEveryFile` according to `header_mode` (`first_chunk_only` strips chunk 1, `every_file` passes `-Y Y`, `none` passes `-S 0`), acquires a slot via `UtilitySlotGovernor.acquire_slot(entity, source)`, and executes `run_tpt_loader(...)`.
 
 3. `OrchestratorService.wait_or_recover_active_db_batch() -> None`
    - **Description**: Queries `BATCH_RUNS` via `db.get_active_batch_run(source)`. Waits via `wait_for_pid_completion()` if `PROCESS_PID` is alive, or reclassifies orphaned batches as `FAILED` if `PROCESS_PID` is dead.
 
-4. `OrchestratorService.scan_and_order_queue() -> List[Dict]`
+4. `OrchestratorService.scan_and_order_queue() -> List[QueuedBatchItem]`
    - **Description**: Invokes `sensor.scan_landing_queue()` to discover all queued Batch Capsules in `LANDING_ZONE/<SOURCE>/` and sorts them chronologically (FIFO).
 
 5. `OrchestratorService.process_batch(ctx: BatchContext) -> int`
-   - **Description**: Executes the complete lifecycle for a single batch: JIT Schema Guard synchronization, parallel entity loading via TPT workers under slot governance, completeness barrier verification, source-keyed and global post-tasks execution, Batch Capsule archiving to `ARCHIVE_ZONE`, and cleanup. Detaches batch file log handlers on exit via `detach_batch_file_logger()`.
+   - **Description**: Executes the complete lifecycle for a single batch: JIT Schema Guard synchronization, parallel entity loading via TPT workers under `UtilitySlotGovernor`, completeness barrier verification, source-keyed and global post-tasks execution, Batch Capsule archiving to `ARCHIVE_ZONE`, and cleanup. Detaches batch file log handlers on exit via `detach_batch_file_logger()`.
 
 6. `OrchestratorService.run(skip_post_tasks: Optional[bool] = None, post_tasks_file: Optional[str] = None) -> int`
    - **Description**: Acquires `dataloader_core.locking.ProcessLock` (`fcntl.flock` + PID tracking) on `LOADING_ZONE/<SOURCE>/.orchestrator.pid`, checks for in-flight batches in `LOADING_ZONE`, scans queued capsules, loops over queued batches enforcing **`FAIL_STOP`**, and closes pooled Teradata connections in `finally`.
@@ -97,8 +112,8 @@ Stores metadata for an active batch in the pipeline:
 #### Functions in `lib/sensor.py`:
 1. `scan_landing_queue(landing_zone: str, manifest_pattern: str = "MANIFEST_*.MF") -> List[Dict[str, Any]]`
    - **Description**: Discovers 1..N queued Batch Capsules (`BATCH_<CLEAN_TS>_<BATCH_ID>/`) and legacy flat manifests. Extracts timestamps and batch IDs, returning a list sorted chronologically in ascending FIFO order.
-2. `verify_descriptor_batch(batch_entry: dict, verify_checksum: bool = True) -> Tuple[bool, str]`
-   - **Description**: Fast-path $O(1)$ verification. Reads `batch_descriptor.json` inside the capsule, verifying declared file sizes and existence without expensive MD5 recalculation. Falls back to MD5 verification if descriptor is absent or `verify_checksum` is forced.
+2. `verify_descriptor_batch(active_zone: str, descriptor: BatchDescriptor, verify_checksum: bool = False) -> Tuple[Dict[str, Dict[str, Any]], List[str]]`
+   - **Description**: Fast-path $O(1)$ verification. Reads pre-computed `BatchDescriptor`, verifying declared file existence and byte sizes in $O(1)$ time without expensive MD5 recalculations. Supports both `files` (metadata dicts) and `data_files` list keys with automatic fallback. Extracts per-entity routing attributes (`delimiter`, `load_mode`, `skip_rows`, `header_mode`, `header_columns`) into `entities_workload`.
 3. `scan_landing_zone(landing_zone: str, manifest_pattern: str = "MANIFEST_*.MF") -> Tuple[str, Optional[str], List[str]]`
    - **Description**: Legacy flat directory scanner. Returns status (`'IDLE'`, `'ERROR_MISSING_MANIFEST'`, `'ERROR_MULTIPLE_MANIFESTS'`, `'VALID'`), manifest path, and data files list.
 4. `parse_manifest_metadata(manifest_path: str, manifest_regex: Optional[str] = None) -> Dict[str, str]`

@@ -85,10 +85,11 @@ flowchart TD
    - Detects uncompleted batches in `LOADING_ZONE/<SOURCE>` from crashed runs, bypasses checksum re-verification, resumes only pending/failed tasks, and completes the lifecycle through archiving.
 7. **Zero Unmanifested Orphans (OPS-02)**:
    - Enforces that all payload files inside the capsule or landing directory match the manifest. Rejects undeclared files.
-8. **Multi-Chunk Header Normalization & Per-Entity Header Modes**:
+8. **Multi-Chunk Header Normalization & Per-Entity Ingestion Schema**:
+   - Leverages the extended 9-column [`CONFIG/entity_mapping.csv`](../../CONFIG/entity_mapping.csv) catalog (`SOURCE, TARGET_TABLE, FILE_SIGNATURE, EXTENSION, INNER_EXTENSION, DELIMITER, LOAD_MODE, SKIP_ROWS, HEADER_MODE`).
    - For BICC Solution A (`header_mode = 'first_chunk_only'`), when an entity consists of multiple chunk files (e.g. `part1.csv`, `part2.csv`), it strips the header from Chunk 1 in-place, writes an idempotent `.<file>.header_stripped` marker, and invokes TPT with wildcard pattern and `SkipRows = 0`. Single-file entities retain their headers and load with `SkipRows = 1`.
    - Supports alternative modes configured via `entity_mapping.csv`: `every_file` (preserves all headers and passes `-S <skip_rows> -Y Y` to TPT) and `none` (headless data files passing `-S 0 -Y N`).
-   - Supports custom delimiters (e.g., `;`, `|`, `\t`) passed via `-s` to TPT.
+   - Supports per-entity delimiters (e.g., `,`, `;`, `|`, `\t`) passed via `-s` to TPT and per-entity load modes (`replace` / `append`) passed via `-m`.
 9. **State Machine Management**:
    - Tracks batch lifecycle in Teradata Vantage tables (`${TDENV}SIDFINTCH.BATCH_RUNS` and `BATCH_TASKS`), permanently recording and retaining `PROCESS_PID` upon completion.
 10. **Parallel Worker Execution & Global Workload Governance**:

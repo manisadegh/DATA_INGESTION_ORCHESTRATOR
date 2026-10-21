@@ -233,6 +233,22 @@ python3 orchestrator.py --config config.json --skip-post-tasks --source ORACLE_F
 | `logmech` | String | `TD2` | Teradata authentication mechanism. |
 | `connection_pool_size` | Integer | `6` | Thread-safe connection pool size managed by `TeradataConnectionManager`. |
 
+### 4.3 Extended Entity Mapping Catalog (`entity_mapping.csv`)
+
+The orchestrator dynamically routes incoming files to target staging tables using [`CONFIG/entity_mapping.csv`](../../CONFIG/entity_mapping.csv). Under the Phase 04 extended specification, each entity can independently configure its delimiter, load mode, and header handling, eliminating hardcoded assumptions while maintaining 100% backward compatibility with legacy 5-column files:
+
+| Column | Status | Default When Omitted | Purpose / Options |
+|---|---|---|---|
+| `SOURCE` | **Required** | — | Upstream source code (`ORACLE_FUSION`, `CRM`, etc.) or `*` for all. |
+| `TARGET_TABLE` | **Required** | — | Staging table name in `${TDENV}SIDFINSTG`. |
+| `FILE_SIGNATURE` | **Required** | — | Substring signature matched against incoming filenames (e.g. `userpvo`). |
+| `EXTENSION` | Optional | `.csv` | Comma-separated list of outer extensions (e.g. `".csv,.zip,.gz,.csv.gz"`). |
+| `INNER_EXTENSION` | Optional | `.csv` | Inner file extension inside archives (`.csv`, `.pecsv`). |
+| `DELIMITER` | Optional | `,` | Field delimiter passed to TPT via `-s` (e.g. `,`, `;`, `\|`, `\t`). |
+| `LOAD_MODE` | Optional | `replace` | Ingestion mode: `replace` (FastLoad) or `append` (MultiLoad). |
+| `SKIP_ROWS` | Optional | `1` | Header lines to skip for single-file loads (passed to TPT via `-S`). |
+| `HEADER_MODE` | Optional | `first_chunk_only` | Multi-chunk header strategy:<br/>- `first_chunk_only`: BICC Solution A (strips chunk 1 header, TPT skips 0, `-Y N`).<br/>- `every_file`: Preserves all headers, instructs TPT to skip headers natively (`-S <skip_rows> -Y Y`).<br/>- `none`: Headless files, loads data without skipping (`-S 0 -Y N`). |
+
 ---
 
 ## 5. Monitoring & Operational Inspection
