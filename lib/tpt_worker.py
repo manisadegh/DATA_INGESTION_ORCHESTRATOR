@@ -21,6 +21,7 @@ def run_tpt_loader(
     skip_precheck: bool = False,
     has_meta: int = 2,
     work_zone: Optional[str] = None,
+    delimiter: Optional[str] = None,
 ):
     """
     Executes the bash wrapper for TPT in a subprocess with auto-healing.
@@ -86,9 +87,9 @@ def run_tpt_loader(
         os.makedirs(work_dir, exist_ok=True)
         cmd.extend(["-w", str(work_dir)])
 
-    delimiter = tpt_config.get('delimiter') or orch_config.get('delimiter')
-    if delimiter:
-        cmd.extend(["-s", str(delimiter)])
+    eff_delimiter = delimiter or tpt_config.get('delimiter') or orch_config.get('delimiter')
+    if eff_delimiter:
+        cmd.extend(["-s", str(eff_delimiter)])
     
     if target_db and work_db:
         cmd.extend([

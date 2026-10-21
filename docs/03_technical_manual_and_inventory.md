@@ -50,7 +50,7 @@ Stores metadata for an active batch in the pipeline:
    - **Description**: Strips line 1 (header) from a delimited text file in-place using a temporary swap file (`.tmp`). Writes a `.<filename>.header_stripped` marker file after staging the swap file and before `os.replace()` to guarantee crash-safe idempotency across task retries.
 
 2. `process_entity_task(entity, entity_info, batch_id, source, extract_timestamp, tpt_config, orch_config, db, schema_guard) -> bool`
-   - **Description**: ThreadPool worker target. Inspects CSV headers, invokes JIT `schema_guard.sync_entity_schema_if_drifted()`, strips Chunk 1 header if multi-chunk delimited text, configures `SkipRows` (`0` for normalized multi-chunks, `1` for single files), invokes `run_tpt_loader(..., skip_precheck=True, has_meta=2)`, and returns task success boolean.
+   - **Description**: ThreadPool worker target. Inspects CSV headers, invokes JIT `schema_guard.sync_entity_schema_if_drifted()`, configures `skip_rows`, `skip_rows_every_file`, and `delimiter` according to entity mapping rule (`header_mode` and custom `delimiter`), acquires a Teradata load slot via `slot_governor.slot()`, invokes `run_tpt_loader(..., delimiter=delimiter, skip_precheck=True, has_meta=2)`, and returns task success boolean.
 
 3. `OrchestratorService.wait_or_recover_active_db_batch() -> None`
    - **Description**: Queries `BATCH_RUNS` via `db.get_active_batch_run(source)`. Waits via `wait_for_pid_completion()` if `PROCESS_PID` is alive, or reclassifies orphaned batches as `FAILED` if `PROCESS_PID` is dead.
@@ -59,10 +59,13 @@ Stores metadata for an active batch in the pipeline:
    - **Description**: Invokes `sensor.scan_landing_queue()` to discover all queued Batch Capsules in `LANDING_ZONE/<SOURCE>/` and sorts them chronologically (FIFO).
 
 5. `OrchestratorService.process_batch(ctx: BatchContext) -> int`
-   - **Description**: Executes the complete lifecycle for a single batch: JIT Schema Guard synchronization, parallel entity loading via TPT workers, completeness barrier verification, source-keyed and global post-tasks execution, Batch Capsule archiving to `ARCHIVE_ZONE`, and cleanup. Detaches batch file log handlers on exit via `detach_batch_file_logger()`.
+   - **Description**: Executes the complete lifecycle for a single batch: JIT Schema Guard synchronization, parallel entity loading via TPT workers under slot governance, completeness barrier verification, source-keyed and global post-tasks execution, Batch Capsule archiving to `ARCHIVE_ZONE`, and cleanup. Detaches batch file log handlers on exit via `detach_batch_file_logger()`.
 
 6. `OrchestratorService.run(skip_post_tasks: Optional[bool] = None, post_tasks_file: Optional[str] = None) -> int`
    - **Description**: Acquires `dataloader_core.locking.ProcessLock` (`fcntl.flock` + PID tracking) on `LOADING_ZONE/<SOURCE>/.orchestrator.pid`, checks for in-flight batches in `LOADING_ZONE`, scans queued capsules, loops over queued batches enforcing **`FAIL_STOP`**, and closes pooled Teradata connections in `finally`.
+
+7. `OrchestratorService.run_all_sources(sources: Optional[List[str]] = None, skip_post_tasks: Optional[bool] = None, post_tasks_file: Optional[str] = None) -> int`
+   - **Description**: Discovers all active source subdirectories in `LANDING_ZONE` (or filters by `sources` list) and invokes `run()` for each source sequentially, exiting immediately on any failure.
 
 ---
 

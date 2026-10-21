@@ -369,6 +369,10 @@ def verify_and_map_batch(
                 "files": [],
                 "extension": matched_rule.raw_extension,
                 "inner_extension": matched_rule.inner_extension,
+                "delimiter": matched_rule.delimiter,
+                "load_mode": matched_rule.load_mode,
+                "skip_rows": matched_rule.skip_rows,
+                "header_mode": matched_rule.header_mode,
             }
         entities_workload[matched_entity]["files"].append(fname)
 
@@ -432,6 +436,10 @@ def verify_descriptor_batch(
             "inner_extension": entity_info.get("inner_extension", ".csv"),
             "header_columns": entity_info.get("header_columns", []),
             "sample_file": entity_info.get("sample_file") or (file_names[0] if file_names else None),
+            "delimiter": entity_info.get("delimiter", ","),
+            "load_mode": entity_info.get("load_mode", "replace"),
+            "skip_rows": entity_info.get("skip_rows", 1),
+            "header_mode": entity_info.get("header_mode", "first_chunk_only"),
         }
 
     return entities_workload, validated_files

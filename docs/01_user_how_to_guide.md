@@ -84,25 +84,38 @@ export LANG="C"
 
 ### 3.1 Invocation Syntax
 ```bash
-python3 orchestrator.py --config <path_to_config.json> [--skip-post-tasks] [--source <SOURCE>] [--post-tasks-file <FILE>]
+python3 orchestrator.py --config <path_to_config.json> [--skip-post-tasks] [--source <SOURCE>] [--sources <S1,S2>] [--all-sources] [--post-tasks-file <FILE>]
 ```
 
 | Parameter | Required | Type | Description |
 |---|---|---|---|
 | `--config` | **Yes** | String | Path to the orchestrator JSON configuration file. |
 | `--skip-post-tasks` | No | Flag | Bypasses all post-ingestion tasks (both source-specific and global dbt/analytics models). |
-| `--source` | No | String | Source system partition code (e.g. `ORACLE_FUSION`, `CRM`). Dynamically partitions `LANDING_ZONE`, `LOADING_ZONE`, `ARCHIVE_ZONE`, and `LOGS` subdirectories. |
+| `--source` | No | String | Single source partition code (e.g. `ORACLE_FUSION`, `CRM`). Dynamically partitions `LANDING_ZONE`, `LOADING_ZONE`, `ARCHIVE_ZONE`, and `LOGS`. |
+| `--sources` | No | String | Comma-separated list of sources to process sequentially (e.g. `ORACLE_FUSION,CRM,ERP`). |
+| `--all-sources` | No | Flag | Automatically scans `LANDING_ZONE` and processes queued capsules across all discovered source partitions. |
 | `--post-tasks-file` | No | String | Path to an external JSON file containing source-specific post-tasks. Merged with source and global tasks. |
 
 ### 3.2 Execution Modes
 
-#### Multi-Batch FIFO Queue Execution (Nominal)
+#### Multi-Batch FIFO Queue Execution (Single Source)
 The orchestrator scans `LANDING_ZONE/<SOURCE>/` for 1..N queued Batch Capsules (`BATCH_<CLEAN_TS>_<BATCH_ID>/`), orders them chronologically (FIFO), and processes each to completion sequentially:
 ```bash
 cd /sg/local/sid/home/Dsidadm/DATA_LOADER/PROCESSING_TOOLS/DATA_INGESTION_ORCHESTRATOR
 python3 orchestrator.py --config config.json --source ORACLE_FUSION
 ```
 If 3 batches are queued (`BATCH_20261016_080000_1001`, `BATCH_20261016_090000_1002`, `BATCH_20261016_100000_1003`), the orchestrator ingests Batch 1001, executes its post-tasks, archives its capsule, and automatically advances to Batch 1002, then 1003.
+
+#### Multi-Source Queue Execution (`--all-sources` / `--sources`)
+To drain queued capsules across multiple source directories in a single command:
+```bash
+# Process all active sources in LANDING_ZONE:
+python3 orchestrator.py --config config.json --all-sources
+
+# Process selected sources:
+python3 orchestrator.py --config config.json --sources CRM,ORACLE_FUSION
+```
+Each source executes in its own partitioned lifecycle while sharing the global Teradata utility slot pool.
 
 #### Automated In-Flight Crash Resumption
 If a previous execution was interrupted while files were inside `LOADING_ZONE/<SOURCE>` (e.g. server reboot or system kill), executing `orchestrator.py` immediately discovers the uncompleted batch and resumes from the point of failure:
@@ -150,6 +163,7 @@ python3 orchestrator.py --config config.json --skip-post-tasks --source ORACLE_F
     "logs_dir": "../../LOGS",
     "entity_mapping_file": "../../CONFIG/entity_mapping.csv",
     "max_concurrent_jobs": 4,
+    "max_global_utility_slots": 8,
     "manifest_pattern": "MANIFEST_*.MF",
     "manifest_regex": "^MANIFEST_([A-Za-z0-9_]+)_(\\d{8}_\\d{6})_([A-Za-z0-9_-]+)\\.MF$",
     "verify_checksum": true,
@@ -188,7 +202,8 @@ python3 orchestrator.py --config config.json --skip-post-tasks --source ORACLE_F
 | `archive_zone` | String | `../../DATA/ARCHIVE_ZONE` | Final batch capsule archive destination (`ARCHIVE_ZONE/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/`). |
 | `logs_dir` | String | `../../LOGS` | Log directory (partitioned into `LOGS/<SOURCE>/`). |
 | `entity_mapping_file` | String | `../../CONFIG/entity_mapping.csv` | File routing CSV mapping file signatures to target staging tables. |
-| `max_concurrent_jobs` | Integer | `4` | Number of parallel worker threads executing TPT concurrently (`ThreadPoolExecutor`). |
+| `max_concurrent_jobs` | Integer | `4` | Number of parallel worker threads executing TPT concurrently within this orchestrator (`ThreadPoolExecutor`). |
+| `max_global_utility_slots` | Integer | `8` | Maximum concurrent Teradata load utility sessions allowed across all orchestrators and sources, governed via `UtilitySlotGovernor`. |
 | `manifest_pattern` | String | `MANIFEST_*.MF` | Wildcard pattern used to locate incoming manifests in `LANDING_ZONE`. |
 | `manifest_regex` | String | `^MANIFEST_...` | Regex capturing `(SOURCE)_(TIMESTAMP)_(BATCH_ID)` from manifest filenames. |
 | `verify_checksum` | Boolean | `true` | When `true`, validates payload files against `batch_descriptor.json` file size ($O(1)$) or MD5 manifest. Automatically disabled during in-flight recovery. |

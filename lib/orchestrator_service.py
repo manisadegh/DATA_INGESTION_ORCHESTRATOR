@@ -36,7 +36,12 @@ from dataloader_core.exceptions import (
     DataLoaderError,
     SchemaSyncError,
 )
-from dataloader_core.locking import ProcessLock, is_pid_alive, wait_for_pid_completion
+from dataloader_core.locking import (
+    ProcessLock,
+    UtilitySlotGovernor,
+    is_pid_alive,
+    wait_for_pid_completion,
+)
 from dataloader_core.logging_utils import (
     add_batch_file_logger,
     detach_batch_file_logger,
@@ -129,7 +134,10 @@ def process_entity_task(
     entity_retries = [t[2] for t in pending_tasks if t[0] == entity]
     retry_count = max(entity_retries) if entity_retries else 0
 
-    load_mode = tpt_config.get("default_load_mode") or orch_config.get("default_load_mode", "replace")
+    load_mode = entity_info.get("load_mode") or tpt_config.get("default_load_mode") or orch_config.get("default_load_mode", "replace")
+    delimiter = entity_info.get("delimiter") or tpt_config.get("delimiter") or orch_config.get("delimiter", ",")
+    header_mode = (entity_info.get("header_mode") or "first_chunk_only").lower()
+    entity_skip_rows = int(entity_info.get("skip_rows", 1))
 
     any_archive = any(f.lower().endswith((".zip", ".gz")) for f in files)
     if any_archive:
@@ -171,40 +179,81 @@ def process_entity_task(
 
     if len(data_files) == 1:
         target_spec = data_files[0]
-        skip_rows = 1
-        skip_rows_every_file = "N"
+        if header_mode == "none":
+            skip_rows = 0
+            skip_rows_every_file = "N"
+        else:
+            skip_rows = entity_skip_rows
+            skip_rows_every_file = "N"
     else:
-        all_delimited = all(f.lower().endswith((".csv", ".pecsv")) for f in data_files)
-        if all_delimited:
-            chunk_1_path = os.path.join(loading_zone, data_files[0])
-            strip_header_in_place(chunk_1_path)
-            target_spec = f"*{signature}*{data_ext}"
+        target_spec = f"*{signature}*{data_ext}"
+        if header_mode == "first_chunk_only":
+            all_delimited = all(f.lower().endswith((".csv", ".pecsv")) for f in data_files)
+            if all_delimited:
+                chunk_1_path = os.path.join(loading_zone, data_files[0])
+                strip_header_in_place(chunk_1_path)
+                skip_rows = 0
+                skip_rows_every_file = "N"
+                logger.info(
+                    f"[{entity}] Multi-chunk detected ({len(data_files)} files, header_mode=first_chunk_only). First chunk header stripped; loading with SkipRows=0."
+                )
+            else:
+                skip_rows = 1
+                skip_rows_every_file = "N"
+        elif header_mode == "every_file":
+            skip_rows = entity_skip_rows
+            skip_rows_every_file = "Y"
+            logger.info(
+                f"[{entity}] Multi-chunk detected ({len(data_files)} files, header_mode=every_file). Preserving headers; loading with SkipRows={skip_rows} and SkipRowsEveryFile='Y'."
+            )
+        elif header_mode == "none":
             skip_rows = 0
             skip_rows_every_file = "N"
             logger.info(
-                f"[{entity}] Multi-chunk detected ({len(data_files)} files). First chunk header stripped; loading with SkipRows=0."
+                f"[{entity}] Multi-chunk detected ({len(data_files)} files, header_mode=none). Loading headless with SkipRows=0."
             )
         else:
-            target_spec = f"*{signature}*{data_ext}"
-            skip_rows = 1
+            skip_rows = entity_skip_rows
             skip_rows_every_file = "N"
 
-    _, success = run_tpt_loader(
-        entity=entity,
-        file_path_or_pattern=target_spec,
-        retry_count=retry_count,
-        batch_id=batch_id,
-        tpt_config=tpt_config,
-        orch_config=orch_config,
-        db_state=db,
-        load_mode=load_mode,
-        skip_rows=skip_rows,
-        skip_rows_every_file=skip_rows_every_file,
-        extract_timestamp=extract_timestamp,
-        source=source,
-        skip_precheck=skip_precheck,
-        has_meta=has_meta,
-    )
+    slot_gov: Optional[UtilitySlotGovernor] = orch_config.get("slot_governor")
+    if slot_gov is not None:
+        with slot_gov.acquire_slot(entity=entity, source=source):
+            _, success = run_tpt_loader(
+                entity=entity,
+                file_path_or_pattern=target_spec,
+                retry_count=retry_count,
+                batch_id=batch_id,
+                tpt_config=tpt_config,
+                orch_config=orch_config,
+                db_state=db,
+                load_mode=load_mode,
+                skip_rows=skip_rows,
+                skip_rows_every_file=skip_rows_every_file,
+                extract_timestamp=extract_timestamp,
+                source=source,
+                skip_precheck=skip_precheck,
+                has_meta=has_meta,
+                delimiter=delimiter,
+            )
+    else:
+        _, success = run_tpt_loader(
+            entity=entity,
+            file_path_or_pattern=target_spec,
+            retry_count=retry_count,
+            batch_id=batch_id,
+            tpt_config=tpt_config,
+            orch_config=orch_config,
+            db_state=db,
+            load_mode=load_mode,
+            skip_rows=skip_rows,
+            skip_rows_every_file=skip_rows_every_file,
+            extract_timestamp=extract_timestamp,
+            source=source,
+            skip_precheck=skip_precheck,
+            has_meta=has_meta,
+            delimiter=delimiter,
+        )
 
     return success
 
@@ -218,12 +267,16 @@ class OrchestratorService:
         source_override: Optional[str] = None,
         skip_post_tasks: bool = False,
         post_tasks_file: Optional[str] = None,
+        all_sources: bool = False,
+        sources_list: Optional[List[str]] = None,
     ) -> None:
         self.logger = setup_orchestrator_console_logger()
         self.config_path = config_path
         self.source_override = source_override
         self.skip_post_tasks = skip_post_tasks
         self.post_tasks_file = post_tasks_file
+        self.all_sources = all_sources
+        self.sources_list = sources_list
 
         self.config = ConfigLoader.load_json_config(config_path)
         self.base_dir = os.path.dirname(os.path.abspath(config_path))
@@ -310,6 +363,15 @@ class OrchestratorService:
 
         self.db: Optional[TeradataStateDB] = None
         self.schema_actions: Dict[str, str] = {}
+
+        # Cross-Process Teradata Utility Slot Governor
+        max_utility_slots = int(self.orch_config.get("max_global_utility_slots", 8))
+        loading_base = (
+            os.path.dirname(self.loading_zone) if self.source_override else self.loading_zone
+        )
+        slot_dir = self.orch_config.get("slot_dir") or os.path.join(loading_base, ".utility_slots")
+        self.slot_governor = UtilitySlotGovernor(slot_dir=slot_dir, max_slots=max_utility_slots, logger=self.logger)
+        self.orch_config["slot_governor"] = self.slot_governor
 
     def _get_db(self) -> TeradataStateDB:
         if self.db is None:
@@ -873,6 +935,53 @@ class OrchestratorService:
 
     finalize_and_archive = run_completeness_barrier_and_archive
 
+    def run_all_sources(self) -> int:
+        """Discovers active source queues and drains them sequentially with unified slot governance."""
+        if self.sources_list:
+            sources_to_run = list(self.sources_list)
+        else:
+            found_sources = set()
+            lz_base = self.orch_config.get("landing_zone")
+            if lz_base and os.path.isdir(lz_base):
+                for item in os.listdir(lz_base):
+                    p = os.path.join(lz_base, item)
+                    if not item.startswith(".") and os.path.isdir(p) and item not in (".utility_slots",):
+                        found_sources.add(item.upper())
+            loading_base = self.orch_config.get("loading_zone")
+            if loading_base and os.path.isdir(loading_base):
+                for item in os.listdir(loading_base):
+                    p = os.path.join(loading_base, item)
+                    if not item.startswith(".") and os.path.isdir(p) and item not in (".utility_slots",):
+                        found_sources.add(item.upper())
+            sources_to_run = sorted(list(found_sources))
+
+        if not sources_to_run:
+            self.logger.info("Multi-source sweep: No active source directories found in LANDING_ZONE or LOADING_ZONE.")
+            return 0
+
+        self.logger.info(f"=== Multi-Source Sweep: Discovered {len(sources_to_run)} source(s): {sources_to_run} ===")
+        for src in sources_to_run:
+            self.logger.info("=" * 70)
+            self.logger.info(f">>> STARTING ORCHESTRATION FOR SOURCE: {src}")
+            self.logger.info("=" * 70)
+            src_service = OrchestratorService(
+                config_path=self.config_path,
+                source_override=src,
+                skip_post_tasks=self.skip_post_tasks,
+                post_tasks_file=self.post_tasks_file,
+            )
+            rc = src_service.run()
+            if rc != 0:
+                self.logger.critical(
+                    f"FATAL: Orchestration failed for source '{src}' with exit code {rc}. Halting sweep (FAIL_STOP)."
+                )
+                return rc
+
+        self.logger.info("=" * 70)
+        self.logger.info(">>> [ALL SOURCES COMPLETE] Multi-source sweep completed with 100% SUCCESS!")
+        self.logger.info("=" * 70)
+        return 0
+
     def run(
         self,
         skip_post_tasks: Optional[bool] = None,
@@ -888,6 +997,9 @@ class OrchestratorService:
             self.skip_post_tasks = skip_post_tasks
         if post_tasks_file is not None:
             self.post_tasks_file = post_tasks_file
+
+        if self.all_sources or self.sources_list:
+            return self.run_all_sources()
 
         pid_file = os.path.join(self.loading_zone, ".orchestrator.pid")
         lock = ProcessLock(

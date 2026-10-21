@@ -41,6 +41,8 @@ def main() -> None:
         help="Skip execution of downstream post-ingestion tasks (e.g. dbt)",
     )
     parser.add_argument("--source", type=str, default=None, help="Explicit data source override")
+    parser.add_argument("--all-sources", action="store_true", default=False, help="Process batches across all sources")
+    parser.add_argument("--sources", type=str, default=None, help="Comma-separated list of sources to orchestrate")
     parser.add_argument(
         "--post-tasks-file",
         type=str,
@@ -49,12 +51,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    sources_list = [s.strip().upper() for s in args.sources.split(",") if s.strip()] if args.sources else None
+
     try:
         service = OrchestratorService(
             config_path=args.config,
             source_override=args.source,
             skip_post_tasks=args.skip_post_tasks,
             post_tasks_file=args.post_tasks_file,
+            all_sources=args.all_sources,
+            sources_list=sources_list,
         )
         sys.exit(service.run())
     except DataLoaderError as exc:

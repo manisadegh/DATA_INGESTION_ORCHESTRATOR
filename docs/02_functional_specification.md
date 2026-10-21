@@ -85,13 +85,15 @@ flowchart TD
    - Detects uncompleted batches in `LOADING_ZONE/<SOURCE>` from crashed runs, bypasses checksum re-verification, resumes only pending/failed tasks, and completes the lifecycle through archiving.
 7. **Zero Unmanifested Orphans (OPS-02)**:
    - Enforces that all payload files inside the capsule or landing directory match the manifest. Rejects undeclared files.
-8. **Multi-Chunk Header Normalization (Solution A)**:
-   - When an entity consists of multiple chunk files (e.g. `part1.csv`, `part2.csv`), it strips the header from Chunk 1 in-place, writes an idempotent `.<file>.header_stripped` marker, and invokes TPT with wildcard pattern and `SkipRows = 0`.
-   - Single-file entities retain their headers and load with `SkipRows = 1`.
+8. **Multi-Chunk Header Normalization & Per-Entity Header Modes**:
+   - For BICC Solution A (`header_mode = 'first_chunk_only'`), when an entity consists of multiple chunk files (e.g. `part1.csv`, `part2.csv`), it strips the header from Chunk 1 in-place, writes an idempotent `.<file>.header_stripped` marker, and invokes TPT with wildcard pattern and `SkipRows = 0`. Single-file entities retain their headers and load with `SkipRows = 1`.
+   - Supports alternative modes configured via `entity_mapping.csv`: `every_file` (preserves all headers and passes `-S <skip_rows> -Y Y` to TPT) and `none` (headless data files passing `-S 0 -Y N`).
+   - Supports custom delimiters (e.g., `;`, `|`, `\t`) passed via `-s` to TPT.
 9. **State Machine Management**:
    - Tracks batch lifecycle in Teradata Vantage tables (`${TDENV}SIDFINTCH.BATCH_RUNS` and `BATCH_TASKS`), permanently recording and retaining `PROCESS_PID` upon completion.
-10. **Parallel Worker Execution**:
+10. **Parallel Worker Execution & Global Workload Governance**:
     - Dispatches entity loading tasks concurrently using `ThreadPoolExecutor`.
+    - Bounds concurrent Teradata FastLoad and MultiLoad utility sessions across all orchestrators and sources using `dataloader_core.locking.UtilitySlotGovernor` (`max_global_utility_slots`, default 8), eliminating Teradata Error 2633 (*Too many load tasks*).
 11. **Reactive Lock Recovery**:
     - Automatically recovers from Teradata Error 2652 (FastLoad/MultiLoad paused) via `unlock_tpt_table.sh`.
 12. **100% Completeness Barrier**:
@@ -100,6 +102,8 @@ flowchart TD
     - Executes source-specific (`post_ingestion_tasks[source]`) and global (`post_ingestion_tasks["default"]`) tasks, injecting batch context environment variables (`CURRENT_BATCH_ID`, `CURRENT_SOURCE`, `CURRENT_TIMESTAMP`, `TDENV`).
 14. **Consolidated Batch Capsule Archiving**:
     - Archives data files, standardized manifest, `batch_descriptor.json`, and raw vaulting receipt into `ARCHIVE_ZONE/<SOURCE>/<YYYY-MM>/BATCH_<ID>_<TS>/`.
+15. **Multi-Source Queue Orchestration (`--all-sources` / `--sources`)**:
+    - Allows a single master orchestrator invocation to discover and process queued capsules across multiple or all source partitions (`ORACLE_FUSION`, `CRM`, etc.) in sequential FIFO cycles while sharing the global utility slot governor.
 
 ---
 

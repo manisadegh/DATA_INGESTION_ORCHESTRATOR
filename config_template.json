@@ -27,6 +27,7 @@
     "archive_zone": "../../DATA/ARCHIVE_ZONE",
     "logs_dir": "../../LOGS",
     "max_concurrent_jobs": 4,
+    "max_global_utility_slots": 8,
     "manifest_pattern": "MANIFEST_*.MF",
     "manifest_regex": "^MANIFEST_([A-Za-z0-9_]+)_(\\d{8}_\\d{6})_([A-Za-z0-9_-]+)\\.MF$",
     "entity_mapping_file": "../../CONFIG/entity_mapping.csv",
