@@ -1,18 +1,17 @@
 """
 lib/sensor.py - Landing Zone Queue Sensor & Batch Payload Validator
 
-Scans LANDING_ZONE for queued Batch Capsules (BATCH_<CLEAN_TS>_<BATCH_ID>/)
-or legacy flat Single-Batch files, enforcing FIFO chronological ordering,
-OPS-01 boundary checks, and validating workloads via `dataloader_core`.
+Scans LANDING_ZONE for queued Batch Capsules (BATCH_<CLEAN_TS>_<BATCH_ID>/),
+enforcing FIFO chronological ordering, OPS-01 boundary checks, and validating
+workloads via `dataloader_core`.
 """
 
 from __future__ import annotations
 
-import glob
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 _COMMON_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "COMMON"))
@@ -21,6 +20,7 @@ if _COMMON_DIR not in sys.path:
 
 from dataloader_core.capsule import BatchDescriptor
 from dataloader_core.checksum import compute_file_checksum
+from dataloader_core.exceptions import BatchValidationError
 from dataloader_core.manifest import parse_manifest_filename, read_manifest_entries
 from dataloader_core.mapping import EntityMapper, inspect_file_inner_extension
 
@@ -31,71 +31,26 @@ DEFAULT_MANIFEST_REGEX = r"^MANIFEST_([A-Za-z0-9_]+)_(\d{8}_\d{6})_([A-Za-z0-9_-
 
 @dataclass
 class QueuedBatchItem:
-    """Represents a discovered batch item in the landing queue (capsule directory or legacy flat)."""
+    """Represents a discovered Batch Capsule directory in the landing queue."""
 
     batch_id: str
     source: str
-    extract_ts: str
-    raw_timestamp: str
-    manifest_path: str
-    manifest_basename: str
-    capsule_dir: Optional[str] = None  # None if legacy flat batch
+    extract_ts: str = ""
+    raw_timestamp: str = ""
+    manifest_path: str = ""
+    manifest_basename: str = ""
+    capsule_dir: str = ""
     descriptor_path: Optional[str] = None
     descriptor: Optional[BatchDescriptor] = None
-    data_files: Optional[List[str]] = None
+    data_files: List[str] = field(default_factory=list)
+    is_capsule: bool = True
+    extract_timestamp: Optional[str] = None
 
-    @property
-    def is_capsule(self) -> bool:
-        return self.capsule_dir is not None
-
-
-def scan_landing_zone(
-    landing_zone: str,
-    manifest_pattern: str = "MANIFEST_*.MF",
-) -> Tuple[str, Any, List[str]]:
-    """
-    Legacy helper: Scans the landing zone and strictly enforces Single-Batch rules.
-    Returns tuple: (status, manifest_path, data_files)
-    status can be:
-      - 'IDLE': 0 manifests, 0 data files (normal exit)
-      - 'ERROR_MISSING_MANIFEST': 0 manifests, but data files exist
-      - 'ERROR_MULTIPLE_MANIFESTS': > 1 manifests found
-      - 'OK': exactly 1 manifest found
-    """
-    if not os.path.exists(landing_zone):
-        os.makedirs(landing_zone, exist_ok=True)
-        return "IDLE", None, []
-
-    all_items = [f for f in os.listdir(landing_zone) if not f.startswith(".")]
-
-    # Search for manifests matching pattern
-    search_path = os.path.join(landing_zone, manifest_pattern)
-    found_manifests = glob.glob(search_path)
-
-    # Also catch any .MF files if pattern didn't match directly
-    if not found_manifests:
-        found_manifests = [os.path.join(landing_zone, f) for f in all_items if f.endswith(".MF")]
-
-    manifest_basenames = set(os.path.basename(m) for m in found_manifests)
-    data_files = [f for f in all_items if f not in manifest_basenames and not os.path.isdir(os.path.join(landing_zone, f))]
-
-    if len(found_manifests) == 0:
-        if len(data_files) == 0:
-            logger.info(f"Landing zone '{landing_zone}' is empty. Nothing to process.")
-            return "IDLE", None, []
-        else:
-            logger.error(
-                f"Data files present in '{landing_zone}', but no manifest file found ({len(data_files)} data files detected)."
-            )
-            return "ERROR_MISSING_MANIFEST", None, data_files
-
-    if len(found_manifests) > 1:
-        logger.error(f"Single-Batch violation: Multiple manifests detected in '{landing_zone}': {found_manifests}.")
-        return "ERROR_MULTIPLE_MANIFESTS", found_manifests, data_files
-
-    manifest_path = found_manifests[0]
-    logger.info(f"Manifest detected: {manifest_path}. Found {len(data_files)} data file(s) in landing zone.")
-    return "OK", manifest_path, data_files
+    def __post_init__(self):
+        if self.extract_timestamp and not self.extract_ts:
+            self.extract_ts = self.extract_timestamp
+        if self.extract_ts and not self.raw_timestamp:
+            self.raw_timestamp = self.extract_ts
 
 
 def scan_landing_queue(
@@ -104,12 +59,12 @@ def scan_landing_queue(
     manifest_regex: Optional[str] = None,
 ) -> Tuple[str, List[QueuedBatchItem]]:
     """
-    Scans landing_zone for 1..N queued Batch Capsules and/or legacy flat manifest batches.
+    Scans landing_zone for 1..N queued Batch Capsules.
     Sorts all discovered items in ascending chronological FIFO order ((extract_timestamp, batch_id)).
 
     Returns:
       (status, queued_items)
-      status: 'IDLE', 'OK', 'ERROR_MISSING_MANIFEST', 'ERROR_MULTIPLE_MANIFESTS'
+      status: 'IDLE', 'OK', 'ERROR_UNEXPECTED_FILES'
     """
     if not os.path.exists(landing_zone):
         os.makedirs(landing_zone, exist_ok=True)
@@ -135,13 +90,11 @@ def scan_landing_queue(
                         logger.warning(f"Could not parse batch descriptor at '{desc_path}': {exc}")
 
                 # Locate manifest file in capsule directory
-                capsule_manifests = glob.glob(os.path.join(entry_path, manifest_pattern))
-                if not capsule_manifests:
-                    capsule_manifests = [
-                        os.path.join(entry_path, f)
-                        for f in os.listdir(entry_path)
-                        if f.endswith(".MF") and not f.startswith(".")
-                    ]
+                capsule_manifests = [
+                    os.path.join(entry_path, f)
+                    for f in os.listdir(entry_path)
+                    if f.endswith(".MF") and not f.startswith(".")
+                ]
 
                 if not capsule_manifests and descriptor is None:
                     logger.warning(f"Capsule directory '{entry}' has neither manifest nor descriptor; ignoring.")
@@ -173,17 +126,6 @@ def scan_landing_queue(
                     batch_id = descriptor.batch_id
                     raw_ts = descriptor.extract_timestamp_raw
 
-                # Data files inside capsule
-                capsule_data_files = [
-                    f
-                    for f in os.listdir(entry_path)
-                    if not f.startswith(".")
-                    and f != os.path.basename(mf_path)
-                    and f != "batch_descriptor.json"
-                    and f != "RAW"
-                    and os.path.isfile(os.path.join(entry_path, f))
-                ]
-
                 queued_items.append(
                     QueuedBatchItem(
                         batch_id=str(batch_id),
@@ -195,57 +137,19 @@ def scan_landing_queue(
                         capsule_dir=entry_path,
                         descriptor_path=desc_path if os.path.exists(desc_path) else None,
                         descriptor=descriptor,
-                        data_files=capsule_data_files,
                     )
                 )
 
-    # 2. Check for legacy flat batch files at the root of landing_zone
-    flat_manifests = glob.glob(os.path.join(landing_zone, manifest_pattern))
-    if not flat_manifests:
-        flat_manifests = [
-            os.path.join(landing_zone, f)
-            for f in visible_entries
-            if f.endswith(".MF") and os.path.isfile(os.path.join(landing_zone, f))
-        ]
-
-    flat_data_files = [
-        f
-        for f in visible_entries
-        if not f.endswith(".MF")
-        and not f.endswith(".json")
-        and os.path.isfile(os.path.join(landing_zone, f))
+    # 2. Check for unexpected regular files at the root of landing_zone
+    unexpected_files = [
+        f for f in visible_entries
+        if os.path.isfile(os.path.join(landing_zone, f))
     ]
-
-    if flat_manifests:
-        if len(flat_manifests) > 1 and not queued_items:
-            logger.error(f"Single-Batch violation: Multiple flat manifests detected in '{landing_zone}': {flat_manifests}")
-            return "ERROR_MULTIPLE_MANIFESTS", []
-
-        for mf_path in flat_manifests:
-            try:
-                meta = parse_manifest_metadata(mf_path, manifest_regex=manifest_regex)
-                queued_items.append(
-                    QueuedBatchItem(
-                        batch_id=str(meta["batch_id"]),
-                        source=meta["source"],
-                        extract_ts=meta["extract_timestamp"],
-                        raw_timestamp=meta.get("raw_timestamp", meta["extract_timestamp"]),
-                        manifest_path=mf_path,
-                        manifest_basename=os.path.basename(mf_path),
-                        capsule_dir=None,
-                        descriptor_path=None,
-                        descriptor=None,
-                        data_files=flat_data_files,
-                    )
-                )
-            except Exception as exc:
-                logger.error(f"Failed parsing flat manifest '{mf_path}': {exc}")
-    elif flat_data_files:
-        orphan_files.extend(flat_data_files)
-
-    if orphan_files and not flat_manifests and not queued_items:
-        logger.error(f"Data files present in '{landing_zone}', but no manifest or capsule found: {orphan_files}")
-        return "ERROR_MISSING_MANIFEST", []
+    if unexpected_files:
+        logger.error(
+            f"Unexpected regular file(s) found at root of landing zone '{landing_zone}': {unexpected_files}"
+        )
+        return "ERROR_UNEXPECTED_FILES", []
 
     if not queued_items:
         return "IDLE", []
@@ -381,8 +285,11 @@ def verify_and_map_batch(
 
 def verify_descriptor_batch(
     active_zone: str,
-    descriptor: BatchDescriptor,
+    descriptor: Optional[Any] = None,
     verify_checksum: bool = False,
+    allow_orphan_files: bool = False,
+    mapper: Optional[Any] = None,
+    **kwargs: Any,
 ) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
     """
     Validates a batch using pre-computed BatchDescriptor:
@@ -391,6 +298,13 @@ def verify_descriptor_batch(
       3. Constructs entities_workload directly from descriptor.entities with header_columns.
     Returns: (entities_workload, validated_files_list)
     """
+    if not isinstance(descriptor, BatchDescriptor):
+        desc_path = os.path.join(active_zone, "batch_descriptor.json")
+        if os.path.exists(desc_path):
+            descriptor = BatchDescriptor.from_json_file(desc_path)
+        else:
+            raise BatchValidationError(f"Missing batch_descriptor.json in '{active_zone}'")
+
     validated_files: List[str] = []
     entities_workload: Dict[str, Dict[str, Any]] = {}
 
@@ -427,6 +341,21 @@ def verify_descriptor_batch(
                     raise ValueError(f"Checksum mismatch for '{fname}': expected {expected_md5}, got {computed_cs}")
 
             validated_files.append(fname)
+
+    # OPS-01 Boundary: Verify no unmanifested/undeclared files exist in active_zone (F2.5)
+    if not allow_orphan_files:
+        manifested_set = set(validated_files)
+        for entry in os.listdir(active_zone):
+            if entry.startswith(".") or entry == "RAW" or entry == ".work":
+                continue
+            entry_path = os.path.join(active_zone, entry)
+            if os.path.isfile(entry_path):
+                if entry == "batch_descriptor.json" or entry.endswith(".MF"):
+                    continue
+                if entry not in manifested_set:
+                    raise ValueError(
+                        f"Boundary violation (OPS-01): Undeclared file '{entry}' found in batch directory '{active_zone}'."
+                    )
 
         entities_workload[target_table] = {
             "target_table": target_table,

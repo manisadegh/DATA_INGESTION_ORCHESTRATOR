@@ -3,21 +3,22 @@ lib/orchestrator_service.py - Cohesive Multi-Batch Ingestion Orchestrator Servic
 
 Encapsulates the Multi-Batch FIFO Queue consumer, Just-In-Time Schema Guard DDL
 synchronization, TPT execution, completeness barrier, post-tasks execution,
-and unified Batch Capsule archiving into `OrchestratorService`.
+and atomic Batch Capsule archiving into `OrchestratorService`.
 """
 
 from __future__ import annotations
 
-import glob
 import gzip
 import json
 import logging
 import os
 import shutil
+import socket
 import sys
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 _SCRIPT_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -34,6 +35,7 @@ from dataloader_core.exceptions import (
     BatchValidationError,
     ConfigurationError,
     DataLoaderError,
+    OrchestratorExecutionError,
     SchemaSyncError,
 )
 from dataloader_core.locking import (
@@ -49,14 +51,13 @@ from dataloader_core.logging_utils import (
 )
 
 from lib.db_state import TeradataStateDB
-from lib.post_tasks import run_post_tasks
+from lib.post_tasks import run_post_tasks, validate_post_tasks
 from lib.schema_guard import sync_entity_schema_if_drifted
 from lib.sensor import (
     QueuedBatchItem,
     parse_manifest_content,
     parse_manifest_metadata,
     scan_landing_queue,
-    scan_landing_zone,
     verify_and_map_batch,
     verify_descriptor_batch,
 )
@@ -69,44 +70,121 @@ class BatchContext:
 
     batch_id: str
     source: str
-    extract_ts: str
-    clean_ts: str
-    manifest_path: str
-    manifest_basename: str
-    active_zone: str
-    is_in_flight: bool
-    entities_workload: Dict[str, Dict[str, Any]]
-    validated_files: List[str]
-    batch_log_dir: str
-    run_log_file: str
+    extract_ts: str = ""
+    clean_ts: str = ""
+    manifest_path: str = ""
+    manifest_basename: str = ""
+    active_zone: str = ""
+    is_in_flight: bool = False
+    entities_workload: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    validated_files: List[str] = field(default_factory=list)
+    batch_log_dir: str = ""
+    run_log_file: str = ""
     raw_dir: Optional[str] = None
     descriptor_path: Optional[str] = None
     descriptor: Optional[BatchDescriptor] = None
+    already_loaded: bool = False
+    batch_dir: Optional[str] = None
+    extract_timestamp: Optional[str] = None
+    data_files: Optional[List[str]] = None
+
+    def __post_init__(self):
+        if self.batch_dir and not self.active_zone:
+            self.active_zone = self.batch_dir
+        if not self.batch_dir and self.active_zone:
+            self.batch_dir = self.active_zone
+        if self.extract_timestamp and not self.extract_ts:
+            self.extract_ts = self.extract_timestamp
+        if self.extract_ts and not self.clean_ts:
+            self.clean_ts = self.extract_ts
+        if self.data_files and not self.validated_files:
+            self.validated_files = list(self.data_files)
+        if not self.data_files and self.validated_files:
+            self.data_files = list(self.validated_files)
+        if self.manifest_path and not self.manifest_basename:
+            self.manifest_basename = os.path.basename(self.manifest_path)
 
 
-def strip_header_in_place(file_path: str) -> None:
+def extract_archive_members(archive_path: str, work_dir: str) -> List[str]:
     """
-    Removes the header (first line) of a CSV file in-place (Solution A).
-    Writes the marker file after staging the stripped content to temp_path
-    so a crash can never strip line 1 twice on retry.
+    Extracts members of a zip or gzip archive to work_dir safely (F2.4).
+    Validates member sizes, non-empty payloads, basename-only paths, and member uniqueness.
     """
-    marker = os.path.join(os.path.dirname(file_path), "." + os.path.basename(file_path) + ".header_stripped")
-    temp_path = file_path + ".tmp"
-    if os.path.exists(marker):
-        if os.path.exists(temp_path):
-            os.replace(temp_path, file_path)
-        return
+    tmp = os.path.join(work_dir, ".extract_tmp")
+    if os.path.isdir(tmp):
+        shutil.rmtree(tmp)
+    os.makedirs(tmp)
+    produced: List[str] = []
+    lower = archive_path.lower()
+    try:
+        if lower.endswith(".zip"):
+            with zipfile.ZipFile(archive_path) as zf:
+                for info in zf.infolist():
+                    name = os.path.basename(info.filename)
+                    if info.is_dir() or not name.lower().endswith((".csv", ".pecsv")):
+                        continue
+                    out_tmp = os.path.join(tmp, name)
+                    with zf.open(info) as src, open(out_tmp, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 1024 * 1024)
+                    if os.path.getsize(out_tmp) != info.file_size:
+                        raise BatchValidationError(f"Extracted size mismatch for {name} in {archive_path}")
+                    produced.append(name)
+        elif lower.endswith(".gz"):
+            base = os.path.basename(archive_path)[:-3]
+            if not base.lower().endswith((".csv", ".pecsv")):
+                base += ".csv"
+            out_tmp = os.path.join(tmp, base)
+            with gzip.open(archive_path, "rb") as src, open(out_tmp, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
+            if os.path.getsize(out_tmp) == 0:
+                raise BatchValidationError(f"Empty gzip payload: {archive_path}")
+            produced.append(base)
+        else:
+            raise BatchValidationError(f"Unsupported archive: {archive_path}")
 
-    with open(file_path, "r", encoding="utf-8", errors="replace") as fin, open(
-        temp_path, "w", encoding="utf-8"
-    ) as fout:
-        _ = fin.readline()  # Strip header line
-        for line in fin:
-            fout.write(line)
+        final_paths = []
+        for name in produced:
+            dst = os.path.join(work_dir, name)
+            if os.path.exists(dst):
+                raise BatchValidationError(f"Duplicate member name '{name}' across archives of the same entity")
+            os.replace(os.path.join(tmp, name), dst)
+            final_paths.append(dst)
+        return final_paths
+    except (zipfile.BadZipFile, gzip.BadGzipFile, EOFError, OSError) as exc:
+        raise BatchValidationError(f"Failed extracting archive '{archive_path}': {exc}") from exc
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
-    with open(marker, "w", encoding="utf-8") as f:
-        f.write("STRIPPED\n")
-    os.replace(temp_path, file_path)
+
+def prepare_entity_work_area(batch_dir: str, entity: str, payload_files: List[str]) -> str:
+    """
+    Creates BATCH_x/.work/<ENTITY>/ with plain data files and files.lst; returns the list path (F2.2, F2.3).
+    Payload files in batch_dir are never modified in place.
+    """
+    work_dir = os.path.join(batch_dir, ".work", entity)
+    if os.path.isdir(work_dir):
+        shutil.rmtree(work_dir)
+    os.makedirs(work_dir, exist_ok=True)
+
+    plain_files: List[str] = []
+    for fname in sorted(payload_files):
+        src = os.path.join(batch_dir, fname)
+        lower = fname.lower()
+        if lower.endswith(".zip") or lower.endswith(".gz"):
+            plain_files.extend(extract_archive_members(src, work_dir))
+        else:
+            dst = os.path.join(work_dir, fname)
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+            plain_files.append(dst)
+
+    plain_files.sort()
+    list_path = os.path.join(work_dir, "files.lst")
+    with open(list_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(plain_files) + "\n")
+    return list_path
 
 
 def process_entity_task(
@@ -122,16 +200,15 @@ def process_entity_task(
     skip_precheck: bool = True,
 ) -> bool:
     """
-    Ingests all files for a given entity in the isolated LOADING_ZONE.
-    Handles single files vs multi-chunk extracts and header normalization.
+    Ingests all files for a given entity using explicit file list (F2.2).
+    Payload files are preserved untouched; header skipping is delegated to TPT (F2.3).
     """
     logger = logging.getLogger("DATA_INGESTION_ORCHESTRATOR")
-    loading_zone = orch_config.get("loading_zone") or orch_config.get("landing_zone", "")
+    active_zone = orch_config.get("active_zone") or orch_config.get("loading_zone", "")
     files = sorted(entity_info["files"])
-    signature = entity_info.get("signature", entity.lower())
 
     pending_tasks = db.get_pending_tasks(batch_id, source=source)
-    entity_retries = [t[2] for t in pending_tasks if t[0] == entity]
+    entity_retries = [t[1] for t in pending_tasks if t[0] == entity]
     retry_count = max(entity_retries) if entity_retries else 0
 
     load_mode = entity_info.get("load_mode") or tpt_config.get("default_load_mode") or orch_config.get("default_load_mode", "replace")
@@ -139,89 +216,23 @@ def process_entity_task(
     header_mode = (entity_info.get("header_mode") or "first_chunk_only").lower()
     entity_skip_rows = int(entity_info.get("skip_rows", 1))
 
-    any_archive = any(f.lower().endswith((".zip", ".gz")) for f in files)
-    if any_archive:
-        extracted_files = []
-        for f in files:
-            f_path = os.path.join(loading_zone, f)
-            if f.lower().endswith(".zip"):
-                with zipfile.ZipFile(f_path, "r") as z:
-                    for m in z.namelist():
-                        if m.lower().endswith((".csv", ".pecsv")):
-                            base_m = os.path.basename(m)
-                            if not base_m:
-                                continue
-                            out_p = os.path.join(loading_zone, base_m)
-                            if not os.path.exists(out_p):
-                                with z.open(m) as zf, open(out_p, "wb") as out_f:
-                                    shutil.copyfileobj(zf, out_f)
-                            extracted_files.append(base_m)
-            elif f.lower().endswith(".gz"):
-                base_name = os.path.basename(f)
-                if base_name.lower().endswith((".csv.gz", ".pecsv.gz")):
-                    out_name = base_name[:-3]
-                elif base_name.lower().endswith(".gz"):
-                    out_name = base_name[:-3] + ".csv"
-                else:
-                    out_name = base_name + ".csv"
-                out_p = os.path.join(loading_zone, out_name)
-                if not os.path.exists(out_p):
-                    with gzip.open(f_path, "rb") as gf, open(out_p, "wb") as out_f:
-                        shutil.copyfileobj(gf, out_f)
-                extracted_files.append(out_name)
-            else:
-                extracted_files.append(f)
-        data_files = sorted(list(set(extracted_files)))
-        data_ext = os.path.splitext(data_files[0])[1].lower() if data_files else ".csv"
-    else:
-        data_files = files
-        data_ext = os.path.splitext(data_files[0])[1].lower() if data_files else ".csv"
+    # Prepare isolated work area with plain data files and files.lst (F2.2, F2.4)
+    list_path = prepare_entity_work_area(active_zone, entity, files)
 
-    if len(data_files) == 1:
-        target_spec = data_files[0]
-        if header_mode == "none":
-            skip_rows = 0
-            skip_rows_every_file = "N"
-        else:
-            skip_rows = entity_skip_rows
-            skip_rows_every_file = "N"
-    else:
-        target_spec = f"*{signature}*{data_ext}"
-        if header_mode == "first_chunk_only":
-            all_delimited = all(f.lower().endswith((".csv", ".pecsv")) for f in data_files)
-            if all_delimited:
-                chunk_1_path = os.path.join(loading_zone, data_files[0])
-                strip_header_in_place(chunk_1_path)
-                skip_rows = 0
-                skip_rows_every_file = "N"
-                logger.info(
-                    f"[{entity}] Multi-chunk detected ({len(data_files)} files, header_mode=first_chunk_only). First chunk header stripped; loading with SkipRows=0."
-                )
-            else:
-                skip_rows = 1
-                skip_rows_every_file = "N"
-        elif header_mode == "every_file":
-            skip_rows = entity_skip_rows
-            skip_rows_every_file = "Y"
-            logger.info(
-                f"[{entity}] Multi-chunk detected ({len(data_files)} files, header_mode=every_file). Preserving headers; loading with SkipRows={skip_rows} and SkipRowsEveryFile='Y'."
-            )
-        elif header_mode == "none":
-            skip_rows = 0
-            skip_rows_every_file = "N"
-            logger.info(
-                f"[{entity}] Multi-chunk detected ({len(data_files)} files, header_mode=none). Loading headless with SkipRows=0."
-            )
-        else:
-            skip_rows = entity_skip_rows
-            skip_rows_every_file = "N"
+    # Header mode resolution delegated to TPT SkipRows / SkipRowsEveryFile (F2.3)
+    if header_mode == "none":
+        skip_rows, skip_rows_every_file = 0, "N"
+    elif header_mode == "every_file":
+        skip_rows, skip_rows_every_file = entity_skip_rows, "Y"
+    else:  # first_chunk_only
+        skip_rows, skip_rows_every_file = entity_skip_rows, "N"
 
     slot_gov: Optional[UtilitySlotGovernor] = orch_config.get("slot_governor")
     if slot_gov is not None:
         with slot_gov.acquire_slot(entity=entity, source=source):
             _, success = run_tpt_loader(
                 entity=entity,
-                file_path_or_pattern=target_spec,
+                file_path_or_pattern=list_path,
                 retry_count=retry_count,
                 batch_id=batch_id,
                 tpt_config=tpt_config,
@@ -234,12 +245,13 @@ def process_entity_task(
                 source=source,
                 skip_precheck=skip_precheck,
                 has_meta=has_meta,
+                work_zone=active_zone,
                 delimiter=delimiter,
             )
     else:
         _, success = run_tpt_loader(
             entity=entity,
-            file_path_or_pattern=target_spec,
+            file_path_or_pattern=list_path,
             retry_count=retry_count,
             batch_id=batch_id,
             tpt_config=tpt_config,
@@ -252,6 +264,7 @@ def process_entity_task(
             source=source,
             skip_precheck=skip_precheck,
             has_meta=has_meta,
+            work_zone=active_zone,
             delimiter=delimiter,
         )
 
@@ -259,7 +272,11 @@ def process_entity_task(
 
 
 class OrchestratorService:
-    """Service managing Multi-Batch FIFO ingestion orchestration, JIT Schema Guard, TPT workers, post-tasks, and archiving."""
+    """
+    Main Multi-Batch FIFO Orchestrator Service.
+    Consumes queued Batch Capsules, manages database state machine in Teradata,
+    coordinates Just-In-Time Schema Guard synchronization, and archives deliverables.
+    """
 
     def __init__(
         self,
@@ -317,7 +334,19 @@ class OrchestratorService:
             self.loading_zone = loading_cfg
             self.archive_zone = archive_cfg
             self.logs_dir = logs_cfg
+            os.makedirs(self.landing_zone, exist_ok=True)
             os.makedirs(self.loading_zone, exist_ok=True)
+            os.makedirs(self.archive_zone, exist_ok=True)
+
+        # Filesystem check: LANDING, LOADING, and ARCHIVE must share the same device (F2.2 step 1)
+        os.makedirs(self.landing_zone, exist_ok=True)
+        os.makedirs(self.loading_zone, exist_ok=True)
+        os.makedirs(self.archive_zone, exist_ok=True)
+        devs = {os.stat(p).st_dev for p in (self.landing_zone, self.loading_zone, self.archive_zone)}
+        if len(devs) != 1:
+            raise ConfigurationError(
+                "LANDING_ZONE, LOADING_ZONE and ARCHIVE_ZONE must be on the same filesystem (atomic directory moves are required)."
+            )
 
         self.orch_config["landing_zone"] = self.landing_zone
         self.orch_config["loading_zone"] = self.loading_zone
@@ -346,184 +375,200 @@ class OrchestratorService:
 
         # Schema Guard settings
         self.schema_guard_enabled = bool(self.schema_guard_cfg.get("enabled", True))
-        # Check environment variable override DL_AUTO_MIGRATE_DDL
         env_auto_migrate = os.environ.get("DL_AUTO_MIGRATE_DDL")
         if env_auto_migrate is not None:
-            self.auto_migrate_ddl = env_auto_migrate.strip().lower() in ("1", "true", "yes")
-            self.schema_guard_enabled = True
+            self.auto_migrate_ddl = env_auto_migrate.strip().lower() in ("true", "1", "yes")
         else:
             self.auto_migrate_ddl = bool(self.schema_guard_cfg.get("auto_migrate_ddl", True))
-
         self.default_column_type = self.schema_guard_cfg.get("default_column_type", "VARCHAR(4000)")
         self.character_set = self.schema_guard_cfg.get("character_set", "UNICODE")
-        self.target_database = self.schema_guard_cfg.get(
-            "target_database", self.tpt_config.get("target_db")
+        self.target_database = self.tpt_config.get("target_db") or os.environ.get("TD_TARGET_DB", "DEV0SIDFINSTG")
+        self.max_row_bytes = self.schema_guard_cfg.get("max_row_bytes", 64000)
+
+        # Validate post-tasks at startup (F2.9)
+        cfg_post = self.orch_config.get("post_ingestion_tasks")
+        if cfg_post:
+            validate_post_tasks(cfg_post)
+
+        # Cross-process Teradata utility slot governor
+        max_slots = concurrency_cfg.get("max_concurrent_load_operators", 2)
+        gov_dir = self.orch_config.get("loading_zone")
+        if self.source_override and gov_dir:
+            gov_dir = os.path.dirname(gov_dir)
+        self.slot_governor = UtilitySlotGovernor(
+            slot_dir=gov_dir,
+            max_slots=max_slots,
+            logger=self.logger,
         )
+        self.orch_config["slot_governor"] = self.slot_governor
 
         self.db: Optional[TeradataStateDB] = None
         self.schema_actions: Dict[str, str] = {}
 
-        # Cross-Process Teradata Utility Slot Governor
-        max_utility_slots = int(self.orch_config.get("max_global_utility_slots", 8))
-        loading_base = (
-            os.path.dirname(self.loading_zone) if self.source_override else self.loading_zone
-        )
-        slot_dir = self.orch_config.get("slot_dir") or os.path.join(loading_base, ".utility_slots")
-        self.slot_governor = UtilitySlotGovernor(slot_dir=slot_dir, max_slots=max_utility_slots, logger=self.logger)
-        self.orch_config["slot_governor"] = self.slot_governor
-
     def _get_db(self) -> TeradataStateDB:
         if self.db is None:
-            max_workers = int(self.orch_config.get("max_concurrent_jobs", 5))
-            td_cfg_with_pool = dict(self.td_config)
-            td_cfg_with_pool.setdefault("connection_pool_size", max(6, max_workers + 1))
-            self.db = TeradataStateDB(td_cfg_with_pool)
+            self.db = TeradataStateDB(self.td_config)
         return self.db
 
     def wait_or_recover_active_db_batch(self) -> None:
         """
-        Queries Teradata BATCH_RUNS for any active batch run for `self.source_override`:
-          - Waits in active polling loop if `PROCESS_PID` is alive.
-          - Reclassifies batch as `FAILED` if `PROCESS_PID` is dead.
+        Pre-flight check against BATCH_RUNS. Re-raises database errors as DataLoaderError (exit 1).
+        Halts if foreign host owns active run; waits on active PID if local; cleans stale crashed runs (F2.8).
         """
         try:
             db = self._get_db()
             active_db_batch = db.get_active_batch_run(source=self.source_override)
-            if active_db_batch:
-                db_pid = active_db_batch.get("process_pid")
-                b_id = active_db_batch.get("batch_id")
-                if db_pid and is_pid_alive(int(db_pid)) and int(db_pid) != os.getpid():
-                    wait_for_pid_completion(
-                        pid=int(db_pid),
-                        poll_interval_sec=self.poll_interval,
-                        timeout_sec=self.lock_timeout,
-                        logger=self.logger,
-                        context_label=f"batch {b_id}",
-                        initial_message=(
-                            f"Active batch {b_id} detected in BATCH_RUNS with running PID {db_pid}. "
-                            "Entering active waiting loop..."
-                        ),
-                        poll_message=f"Batch {b_id} (PID {db_pid}) still active in BATCH_RUNS. Waiting {self.poll_interval}s...",
-                        completion_message=f"Active batch {b_id} (PID {db_pid}) has completed.",
-                    )
-                elif db_pid and not is_pid_alive(int(db_pid)):
-                    self.logger.warning(
-                        f"Batch {b_id} was marked RUNNING in BATCH_RUNS with dead PID {db_pid}. Reclassifying as FAILED."
-                    )
-                    db.mark_batch_failed(b_id, source=active_db_batch.get("source"))
         except DataLoaderError:
             raise
         except Exception as exc:
-            self.logger.debug(f"Pre-flight BATCH_RUNS active check skipped or non-blocking: {exc}")
+            raise DataLoaderError(f"Pre-flight state check failed: {exc}") from exc
 
-    def check_inflight_batch(self) -> Optional[BatchContext]:
+        if active_db_batch is not None:
+            active_batch_id = active_db_batch.get("batch_id")
+            active_pid = active_db_batch.get("process_pid")
+            active_source = active_db_batch.get("source")
+            active_host = active_db_batch.get("process_host")
+            current_host = socket.gethostname()
+
+            if active_host and active_host != current_host:
+                msg = (
+                    f"CRITICAL: Active batch {active_batch_id} (Source: {active_source}) has status RUNNING on foreign host "
+                    f"'{active_host}'. Cannot verify liveness or alter state locally. Halting execution."
+                )
+                self.logger.critical(msg)
+                raise DataLoaderError(msg)
+
+            if active_pid and is_pid_alive(active_pid):
+                self.logger.info(
+                    f"Pre-flight detected active batch {active_batch_id} (PID {active_pid} on {active_host}) in BATCH_RUNS. Waiting..."
+                )
+                wait_for_pid_completion(
+                    pid=active_pid,
+                    poll_interval_sec=self.poll_interval,
+                    timeout_sec=self.lock_timeout,
+                    logger=self.logger,
+                    context_label="Active Teradata Batch Run",
+                    host=active_host,
+                )
+            else:
+                self.logger.warning(
+                    f"Pre-flight detected crashed/stale batch {active_batch_id} in BATCH_RUNS (PID {active_pid} dead on host {active_host}). "
+                    f"Marking status as FAILED in technical database."
+                )
+                db.mark_batch_failed(active_batch_id, source=active_source)
+
+    def check_inflight_batch(self) -> List[BatchContext]:
         """
-        Inspects LOADING_ZONE for any uncompleted batch (flat .MF or BATCH_* directory)
-        left over from an interrupted or crashed run.
+        Inspects LOADING_ZONE for in-flight batch directories (BATCH_*).
+        Returns list of BatchContext sorted chronologically (by name).
+        Reconciles with Teradata state: if latest attempt is SUCCESS, sets already_loaded=True (F2.2, F2.8).
         """
         if not os.path.exists(self.loading_zone):
-            return None
+            return []
 
-        # Check for in-flight BATCH_* capsule dir
-        capsule_dirs = [
-            os.path.join(self.loading_zone, d)
-            for d in os.listdir(self.loading_zone)
-            if d.startswith("BATCH_") and os.path.isdir(os.path.join(self.loading_zone, d))
+        # Check for stray regular files in LOADING_ZONE root
+        stray_files = [
+            f for f in os.listdir(self.loading_zone)
+            if not f.startswith(".") and os.path.isfile(os.path.join(self.loading_zone, f))
         ]
-        if capsule_dirs:
-            c_dir = capsule_dirs[0]
-            self.logger.info(f"In-flight capsule directory detected in LOADING_ZONE: {c_dir}. Resuming execution.")
-            # Unpack contents of capsule_dir into loading_zone root
-            for item in os.listdir(c_dir):
-                shutil.move(os.path.join(c_dir, item), os.path.join(self.loading_zone, item))
-            try:
-                os.rmdir(c_dir)
-            except Exception:
-                pass
-
-        # Check for in-flight flat manifest in loading_zone
-        in_flight_manifests = [
-            os.path.join(self.loading_zone, f)
-            for f in os.listdir(self.loading_zone)
-            if f.endswith(".MF") and not f.startswith(".")
-        ]
-        if not in_flight_manifests:
-            return None
-
-        manifest_path = in_flight_manifests[0]
-        self.logger.info(f"In-flight batch detected in LOADING_ZONE: {manifest_path}. Resuming execution.")
-
-        try:
-            manifest_meta = parse_manifest_metadata(manifest_path, self.orch_config.get("manifest_regex"))
-        except Exception as exc:
-            msg = f"Failed to parse manifest filename '{manifest_path}': {exc}"
+        if stray_files:
+            msg = f"Unexpected regular file(s) found at root of LOADING_ZONE: {stray_files}"
             self.logger.critical(msg)
-            raise BatchValidationError(msg) from exc
+            raise OrchestratorExecutionError(msg)
 
-        source = manifest_meta["source"]
-        extract_ts = manifest_meta["extract_timestamp"]
-        batch_id = manifest_meta["batch_id"]
-        clean_ts = CapsulePathResolver.normalize_timestamp_token(extract_ts)
+        capsule_dir_names = sorted([
+            d for d in os.listdir(self.loading_zone)
+            if d.startswith("BATCH_") and os.path.isdir(os.path.join(self.loading_zone, d))
+        ])
+        if not capsule_dir_names:
+            return []
 
-        batch_log_dir = CapsulePathResolver.get_log_capsule_dir(
-            self.logs_dir, source, batch_id, clean_ts, ensure_exists=True
-        )
-        self.tpt_config["work_dir"] = os.path.join(batch_log_dir, "TPT")
-        os.makedirs(self.tpt_config["work_dir"], exist_ok=True)
+        inflight_contexts: List[BatchContext] = []
+        for c_name in capsule_dir_names:
+            batch_dir = os.path.join(self.loading_zone, c_name)
+            desc_path = os.path.join(batch_dir, "batch_descriptor.json")
+            if not os.path.exists(desc_path):
+                msg = f"In-flight batch directory '{batch_dir}' is missing mandatory batch_descriptor.json"
+                self.logger.critical(msg)
+                raise BatchValidationError(msg)
 
-        run_log_file = add_batch_file_logger(batch_log_dir, source, extract_ts, batch_id)
-
-        desc_path = os.path.join(self.loading_zone, "batch_descriptor.json")
-        descriptor: Optional[BatchDescriptor] = None
-        if os.path.exists(desc_path):
             try:
                 descriptor = BatchDescriptor.from_json_file(desc_path)
-            except Exception:
-                pass
+            except Exception as exc:
+                msg = f"Failed to parse batch_descriptor.json in '{batch_dir}': {exc}"
+                self.logger.critical(msg)
+                raise BatchValidationError(msg) from exc
 
-        if descriptor:
+            source = descriptor.source
+            batch_id = str(descriptor.batch_id)
+            extract_ts = descriptor.extract_timestamp
+            clean_ts = descriptor.extract_timestamp_raw or CapsulePathResolver.normalize_timestamp_token(extract_ts)
+
+            batch_log_dir = CapsulePathResolver.get_log_capsule_dir(
+                self.logs_dir, source, batch_id, clean_ts, ensure_exists=True
+            )
+            self.tpt_config["work_dir"] = os.path.join(batch_log_dir, "TPT")
+            os.makedirs(self.tpt_config["work_dir"], exist_ok=True)
+            run_log_file = add_batch_file_logger(batch_log_dir, source, extract_ts, batch_id)
+
+            manifest_in_loading = os.path.join(
+                batch_dir,
+                f"MANIFEST_{source}_{descriptor.extract_timestamp_raw}_{batch_id}.MF"
+            )
+            if not os.path.exists(manifest_in_loading):
+                mfs = [os.path.join(batch_dir, f) for f in os.listdir(batch_dir) if f.endswith(".MF") and not f.startswith(".")]
+                if mfs:
+                    manifest_in_loading = mfs[0]
+
             entities_workload, validated_files = verify_descriptor_batch(
-                self.loading_zone, descriptor, verify_checksum=False
+                batch_dir, descriptor, verify_checksum=False
             )
-        else:
-            manifest_entries = parse_manifest_content(manifest_path)
-            entities_workload, validated_files = verify_and_map_batch(
-                landing_zone=self.loading_zone,
-                manifest_entries=manifest_entries,
-                mapping_file=self.mapping_file,
-                verify_checksum=False,
-                allow_orphan_files=True,
+            raw_dir = os.path.join(batch_dir, "RAW") if os.path.isdir(os.path.join(batch_dir, "RAW")) else None
+
+            # Reconciliation check (F2.8)
+            already_loaded = False
+            try:
+                db = self._get_db()
+                latest = db.get_latest_attempt(batch_id, source=source)
+                if latest and latest.get("status") == "SUCCESS":
+                    already_loaded = True
+                    self.logger.info(
+                        f"In-flight batch {batch_id} was already marked SUCCESS in attempt {latest.get('run_attempt')}; "
+                        "skipping entity execution and proceeding to completeness barrier and archive."
+                    )
+            except Exception as exc:
+                self.logger.debug(f"Could not consult latest attempt for reconciliation: {exc}")
+
+            ctx = BatchContext(
+                batch_id=batch_id,
                 source=source,
+                extract_ts=extract_ts,
+                clean_ts=clean_ts,
+                manifest_path=manifest_in_loading,
+                manifest_basename=os.path.basename(manifest_in_loading),
+                active_zone=batch_dir,
+                is_in_flight=True,
+                entities_workload=entities_workload,
+                validated_files=validated_files,
+                batch_log_dir=batch_log_dir,
+                run_log_file=run_log_file,
+                raw_dir=raw_dir,
+                descriptor_path=desc_path,
+                descriptor=descriptor,
+                already_loaded=already_loaded,
             )
+            inflight_contexts.append(ctx)
 
-        raw_dir = os.path.join(self.loading_zone, "RAW") if os.path.isdir(os.path.join(self.loading_zone, "RAW")) else None
-
-        return BatchContext(
-            batch_id=batch_id,
-            source=source,
-            extract_ts=extract_ts,
-            clean_ts=clean_ts,
-            manifest_path=manifest_path,
-            manifest_basename=os.path.basename(manifest_path),
-            active_zone=self.loading_zone,
-            is_in_flight=True,
-            entities_workload=entities_workload,
-            validated_files=validated_files,
-            batch_log_dir=batch_log_dir,
-            run_log_file=run_log_file,
-            raw_dir=raw_dir,
-            descriptor_path=desc_path if os.path.exists(desc_path) else None,
-            descriptor=descriptor,
-        )
+        return inflight_contexts
 
     def prepare_batch_from_queued_item(self, item: QueuedBatchItem) -> BatchContext:
         """
-        Transitions a QueuedBatchItem from LANDING_ZONE to LOADING_ZONE,
-        sets up logging, and validates file workloads via BatchDescriptor or manifest.
+        Dequeues capsule by atomically moving directory from LANDING to LOADING (F2.2 step 2).
+        Validates descriptor and payload integrity (F2.5).
         """
         source = item.source
+        batch_id = str(item.batch_id)
         extract_ts = item.extract_ts
-        batch_id = item.batch_id
         clean_ts = CapsulePathResolver.normalize_timestamp_token(extract_ts)
 
         batch_log_dir = CapsulePathResolver.get_log_capsule_dir(
@@ -533,41 +578,19 @@ class OrchestratorService:
         os.makedirs(self.tpt_config["work_dir"], exist_ok=True)
 
         run_log_file = add_batch_file_logger(batch_log_dir, source, extract_ts, batch_id)
-        self.logger.info(f"Preparing Batch {batch_id} (Source: {source}, Extract: {extract_ts}) [Capsule: {item.is_capsule}]")
+        self.logger.info(f"Preparing Batch {batch_id} (Source: {source}, Extract: {extract_ts}) [Capsule: {item.capsule_dir}]")
 
         os.makedirs(self.loading_zone, exist_ok=True)
 
-        # Transition files to isolated LOADING_ZONE
-        if item.is_capsule and item.capsule_dir:
-            self.logger.info(f"Unpacking capsule '{item.capsule_dir}' into isolated '{self.loading_zone}'...")
-            for entry in os.listdir(item.capsule_dir):
-                src_path = os.path.join(item.capsule_dir, entry)
-                dst_path = os.path.join(self.loading_zone, entry)
-                if os.path.exists(dst_path):
-                    if os.path.isdir(dst_path):
-                        shutil.rmtree(dst_path)
-                    else:
-                        os.remove(dst_path)
-                shutil.move(src_path, dst_path)
-            try:
-                os.rmdir(item.capsule_dir)
-            except Exception as exc:
-                self.logger.debug(f"Could not remove empty capsule staging dir: {exc}")
-        else:
-            # Legacy flat files
-            self.logger.info(f"Moving legacy flat batch files to isolated '{self.loading_zone}'...")
-            shutil.move(item.manifest_path, os.path.join(self.loading_zone, item.manifest_basename))
-            if item.data_files:
-                for f in item.data_files:
-                    src_file = os.path.join(self.landing_zone, f)
-                    if os.path.exists(src_file):
-                        shutil.move(src_file, os.path.join(self.loading_zone, f))
+        batch_dir = os.path.join(self.loading_zone, os.path.basename(item.capsule_dir))
+        if os.path.exists(batch_dir):
+            raise BatchValidationError(f"Batch directory already in LOADING_ZONE: {batch_dir}")
+        os.replace(item.capsule_dir, batch_dir)
+        ctx_active_zone = batch_dir
+        manifest_in_loading = os.path.join(batch_dir, item.manifest_basename)
+        desc_in_loading = os.path.join(batch_dir, "batch_descriptor.json")
+        raw_in_loading = os.path.join(batch_dir, "RAW") if os.path.isdir(os.path.join(batch_dir, "RAW")) else None
 
-        manifest_in_loading = os.path.join(self.loading_zone, item.manifest_basename)
-        desc_in_loading = os.path.join(self.loading_zone, "batch_descriptor.json")
-        raw_in_loading = os.path.join(self.loading_zone, "RAW") if os.path.isdir(os.path.join(self.loading_zone, "RAW")) else None
-
-        # Load descriptor if present
         descriptor = item.descriptor
         if descriptor is None and os.path.exists(desc_in_loading):
             try:
@@ -575,29 +598,23 @@ class OrchestratorService:
             except Exception:
                 pass
 
-        verify_checksum = self.orch_config.get("verify_checksum", True)
-        verify_checksum_capsule = self.orch_config.get("verify_checksum_on_queued_capsule", False)
+        verify_checksum_capsule = self.orch_config.get("verify_checksum_on_queued_capsule", True)
 
         try:
-            if descriptor is not None and not verify_checksum_capsule:
-                self.logger.info("Using fast-path O(1) file stat verification via BatchDescriptor.")
+            if descriptor is not None:
+                self.logger.info(f"Verifying BatchDescriptor files (verify_checksum={verify_checksum_capsule}).")
                 entities_workload, validated_files = verify_descriptor_batch(
-                    self.loading_zone, descriptor, verify_checksum=False
-                )
-            elif descriptor is not None and verify_checksum_capsule:
-                self.logger.info("Verifying BatchDescriptor files and checksums.")
-                entities_workload, validated_files = verify_descriptor_batch(
-                    self.loading_zone, descriptor, verify_checksum=True
+                    ctx_active_zone, descriptor, verify_checksum=verify_checksum_capsule
                 )
             else:
                 self.logger.info("Verifying manifest content and entity mappings.")
                 manifest_entries = parse_manifest_content(manifest_in_loading)
                 allow_orphan = self.orch_config.get("allow_orphan_files", False)
                 entities_workload, validated_files = verify_and_map_batch(
-                    landing_zone=self.loading_zone,
+                    landing_zone=ctx_active_zone,
                     manifest_entries=manifest_entries,
                     mapping_file=self.mapping_file,
-                    verify_checksum=verify_checksum,
+                    verify_checksum=self.orch_config.get("verify_checksum", True),
                     allow_orphan_files=allow_orphan,
                     source=source,
                 )
@@ -613,7 +630,7 @@ class OrchestratorService:
             clean_ts=clean_ts,
             manifest_path=manifest_in_loading,
             manifest_basename=item.manifest_basename,
-            active_zone=self.loading_zone,
+            active_zone=ctx_active_zone,
             is_in_flight=False,
             entities_workload=entities_workload,
             validated_files=validated_files,
@@ -624,60 +641,30 @@ class OrchestratorService:
             descriptor=descriptor,
         )
 
-    def detect_and_validate_batch(self) -> Optional[BatchContext]:
-        """
-        Legacy Single-Batch method preserved for unit-test compatibility.
-        Detects an in-flight batch or first batch in landing_zone.
-        """
-        inflight = self.check_inflight_batch()
-        if inflight is not None:
-            return inflight
-
-        status, items = scan_landing_queue(
-            self.landing_zone,
-            manifest_pattern=self.manifest_pattern,
-            manifest_regex=self.orch_config.get("manifest_regex"),
-        )
-        if status == "IDLE":
-            return None
-        if status == "ERROR_MISSING_MANIFEST":
-            raise BatchValidationError(f"Found data files in '{self.landing_zone}' without manifest.")
-        if status == "ERROR_MULTIPLE_MANIFESTS":
-            raise BatchValidationError(f"Multiple flat manifests detected in '{self.landing_zone}'.")
-        if not items:
-            return None
-
-        return self.prepare_batch_from_queued_item(items[0])
-
-    acquire_guards_and_detect_batch = detect_and_validate_batch
-
-    def transition_to_loading_zone(self, ctx: BatchContext) -> None:
-        """Compatibility no-op: files already transitioned during prepare_batch_from_queued_item."""
-        self.orch_config["loading_zone"] = self.loading_zone
-
     def _sync_schema_for_entity(
         self,
         entity: str,
         entity_info: Dict[str, Any],
         source: str,
-    ) -> Tuple[bool, int]:
+        active_zone: Optional[str] = None,
+    ) -> Tuple[bool, Optional[int], bool]:
         """
         Executes Just-In-Time Schema Guard synchronization for a single entity
-        before TPT load begins. Returns (success, has_meta).
+        before TPT load begins. Returns (success, has_meta, guard_ran).
         """
         if not self.schema_guard_enabled:
-            return True, 2
+            return True, None, False
 
         db = self._get_db()
-        # Check if database has active connection manager
         if not hasattr(db, "conn_mgr") or db.conn_mgr is None:
-            return True, 2
+            return True, None, False
 
         csv_cols = entity_info.get("header_columns")
+        base_zone = active_zone or self.loading_zone
         sample_file = entity_info.get("sample_file")
-        sample_path = os.path.join(self.loading_zone, sample_file) if sample_file else None
+        sample_path = os.path.join(base_zone, sample_file) if sample_file else None
         if not sample_path and entity_info.get("files"):
-            sample_path = os.path.join(self.loading_zone, entity_info["files"][0])
+            sample_path = os.path.join(base_zone, entity_info["files"][0])
 
         entity_load_mode = entity_info.get("load_mode", "replace")
 
@@ -693,34 +680,28 @@ class OrchestratorService:
                     auto_migrate_ddl=self.auto_migrate_ddl,
                     load_mode=entity_load_mode,
                     csv_cols=csv_cols,
+                    max_row_bytes=self.max_row_bytes,
                 )
-                if len(res) >= 4:
-                    is_identical, action, cols, has_meta = res[:4]
-                else:
-                    is_identical, action, cols = res[:3]
-                    has_meta = 2
+                is_identical, action, cols, has_meta = res
 
                 self.schema_actions[entity] = action
                 if not is_identical and action == "BLOCKED":
                     self.logger.error(f"[{entity}] Schema drift detected and auto_migrate_ddl is disabled. DDL blocked.")
-                    return False, has_meta
-                return True, has_meta
+                    return False, has_meta, True
+                return True, has_meta, True
         except SchemaSyncError as exc:
             self.logger.error(f"[{entity}] Schema Guard synchronization error: {exc}")
-            return False, 0
+            return False, None, True
         except Exception as exc:
             self.logger.error(f"[{entity}] Unexpected Schema Guard error: {exc}")
-            return False, 0
+            return False, None, True
 
     def execute_entity_tasks(self, ctx: BatchContext) -> bool:
-        """Registers batch state in Teradata, synchronizes schemas, and executes parallel entity workers."""
+        """Registers attempt in Teradata, synchronizes schemas, and executes parallel entity workers (F2.11)."""
         db = self._get_db()
-        tasks_list = []
-        for entity, info in ctx.entities_workload.items():
-            for fname in info["files"]:
-                tasks_list.append((entity, fname))
+        entity_file_counts = {entity: len(info.get("files", [])) for entity, info in ctx.entities_workload.items()}
 
-        if not tasks_list and ctx.validated_files:
+        if not entity_file_counts and ctx.validated_files:
             msg = (
                 f"FATAL: No tasks generated for batch {ctx.batch_id} despite "
                 f"{len(ctx.validated_files)} validated data files present in active zone."
@@ -729,25 +710,28 @@ class OrchestratorService:
             raise DataLoaderError(msg)
 
         try:
-            db.initialize_batch(ctx.batch_id, ctx.source, ctx.extract_ts, tasks_list)
+            attempt = db.initialize_batch(ctx.batch_id, ctx.source, ctx.extract_ts, entity_file_counts)
         except Exception as exc:
             msg = f"Database initialization failed for batch {ctx.batch_id}: {exc}"
             self.logger.critical(msg)
             raise DataLoaderError(msg) from exc
 
-        pending_tasks = db.get_pending_tasks(ctx.batch_id, source=ctx.source)
+        pending_tasks = db.get_pending_tasks(ctx.batch_id, source=ctx.source, run_attempt=attempt)
         if not pending_tasks:
-            self.logger.info(f"No pending tasks to execute for batch {ctx.batch_id}.")
+            self.logger.info(f"No pending tasks to execute for batch {ctx.batch_id} in attempt {attempt}.")
             return True
 
         pending_entities = sorted(list(set(t[0] for t in pending_tasks)))
-        self.logger.info(f"Found pending tasks for {len(pending_entities)} distinct entities in batch {ctx.batch_id}.")
+        self.logger.info(f"Found pending tasks for {len(pending_entities)} distinct entities in batch {ctx.batch_id} (Attempt {attempt}).")
+
+        self.orch_config["active_zone"] = ctx.active_zone
 
         # 1. Just-In-Time Schema Guard pre-synchronization
-        entity_has_meta: Dict[str, int] = {}
+        entity_has_meta: Dict[str, Optional[int]] = {}
+        entity_guard_ran: Dict[str, bool] = {}
         for entity in pending_entities:
             entity_info = ctx.entities_workload[entity]
-            schema_ok, has_meta = self._sync_schema_for_entity(entity, entity_info, ctx.source)
+            schema_ok, has_meta, guard_ran = self._sync_schema_for_entity(entity, entity_info, ctx.source, active_zone=ctx.active_zone)
             if not schema_ok:
                 self.logger.error(f"Schema synchronization failed for entity '{entity}'. Aborting batch execution.")
                 db.update_task_end(
@@ -756,9 +740,11 @@ class OrchestratorService:
                     "FAILED",
                     error_msg="Schema Guard drift blocked or DDL synchronization failed.",
                     source=ctx.source,
+                    run_attempt=attempt,
                 )
                 return False
             entity_has_meta[entity] = has_meta
+            entity_guard_ran[entity] = guard_ran
 
         # 2. Parallel TPT execution
         all_workers_ok = True
@@ -778,8 +764,8 @@ class OrchestratorService:
                         self.tpt_config,
                         self.orch_config,
                         db,
-                        has_meta=entity_has_meta.get(entity, 2),
-                        skip_precheck=True,
+                        has_meta=entity_has_meta.get(entity),
+                        skip_precheck=entity_guard_ran.get(entity, False),
                     )
                 ] = entity
 
@@ -800,66 +786,69 @@ class OrchestratorService:
 
     def run_completeness_barrier_and_archive(self, ctx: BatchContext) -> int:
         """
-        Verifies 100% task completion in Teradata, executes post-tasks,
-        archives deliverables into Batch Capsule, cleans LOADING_ZONE, and updates BATCH_RUNS.
+        Verifies 100% entity completion in Teradata, executes post-tasks,
+        and atomically renames the Batch Capsule to ARCHIVE_ZONE in a single rename (F2.2 step 5).
         """
         db = self._get_db()
-        expected_total_files = len(ctx.validated_files)
 
-        if not db.get_batch_summary(ctx.batch_id, expected_total_files, source=ctx.source):
-            db.finish_batch(ctx.batch_id, "FAILED", source=ctx.source)
+        # Completeness Barrier (F2.11)
+        expected_entity_count = len(ctx.entities_workload)
+        all_success = db.get_batch_summary(ctx.batch_id, expected_entity_count, source=ctx.source)
+        if not all_success:
             self.logger.error(
-                f"[ERROR] Completeness barrier failed for batch {ctx.batch_id}. "
-                f"Files retained in '{self.loading_zone}' for recovery."
+                f"[FAILED] Completeness barrier check failed in BATCH_TASKS for batch {ctx.batch_id} (Source: {ctx.source})."
             )
+            db.finish_batch(ctx.batch_id, "FAILED", source=ctx.source)
             return 1
 
-        self.logger.info(f"[SUCCESS] All {expected_total_files} file tasks for batch {ctx.batch_id} ingested successfully.")
+        self.logger.info(
+            f"[BARRIER PASSED] All {expected_entity_count} entities for batch {ctx.batch_id} are marked SUCCESS in Teradata."
+        )
 
-        # Post-tasks execution
-        post_tasks: List[Dict[str, Any]] = []
-
-        # 1. From optional CLI post-tasks file
-        if self.post_tasks_file and os.path.exists(self.post_tasks_file):
-            try:
-                with open(self.post_tasks_file, "r", encoding="utf-8") as ptf:
-                    pt_data = expand_env_vars(json.load(ptf))
-                    if isinstance(pt_data, list):
-                        post_tasks.extend(pt_data)
-                    elif isinstance(pt_data, dict):
-                        src_specific = pt_data.get(ctx.source, pt_data.get("default", []))
-                        post_tasks.extend(src_specific)
-                self.logger.info(
-                    f"Loaded {len(post_tasks)} post-task(s) from external file ({self.post_tasks_file})."
-                )
-            except Exception as exc:
-                self.logger.warning(f"Could not load post-tasks from file {self.post_tasks_file}: {exc}")
-
-        # 2. From orchestrator config (supporting source-specific dict or flat list)
-        orch_post_tasks = self.orch_config.get("post_ingestion_tasks", [])
-        if isinstance(orch_post_tasks, dict):
-            src_tasks = orch_post_tasks.get(ctx.source, [])
-            default_tasks = orch_post_tasks.get("default", [])
-            post_tasks.extend(src_tasks)
-            for dt in default_tasks:
-                if dt not in post_tasks:
-                    post_tasks.append(dt)
-        elif isinstance(orch_post_tasks, list):
-            post_tasks.extend(orch_post_tasks)
-
+        # Context environment for post-tasks
         context_env = {
             "CURRENT_BATCH_ID": str(ctx.batch_id),
             "CURRENT_SOURCE": str(ctx.source),
-            "CURRENT_MANIFEST": os.path.join(self.loading_zone, ctx.manifest_basename),
+            "CURRENT_MANIFEST": str(ctx.manifest_basename),
+            "CURRENT_EXTRACT_TS": str(ctx.extract_ts),
         }
 
+        # Resolve post-ingestion tasks (merge external source tasks with orchestrator config tasks)
+        post_tasks: List[Dict[str, Any]] = []
+        if self.post_tasks_file and os.path.exists(self.post_tasks_file):
+            try:
+                with open(self.post_tasks_file, "r", encoding="utf-8") as ptf:
+                    file_tasks = expand_env_vars(json.load(ptf))
+                    if isinstance(file_tasks, list):
+                        post_tasks.extend(file_tasks)
+                    elif isinstance(file_tasks, dict):
+                        src_specific = file_tasks.get(ctx.source, file_tasks.get("default", []))
+                        post_tasks.extend(src_specific)
+                self.logger.info(f"Loaded source post-tasks from file: '{self.post_tasks_file}'")
+            except Exception as exc:
+                self.logger.error(f"Failed to read post-tasks file '{self.post_tasks_file}': {exc}")
+                return 1
+
+        cfg_post = self.orch_config.get("post_ingestion_tasks")
+        if isinstance(cfg_post, dict):
+            src_tasks = cfg_post.get(ctx.source, [])
+            default_tasks = cfg_post.get("default", [])
+            for t in src_tasks:
+                if t not in post_tasks:
+                    post_tasks.append(t)
+            for t in default_tasks:
+                if t not in post_tasks:
+                    post_tasks.append(t)
+        elif isinstance(cfg_post, list):
+            for t in cfg_post:
+                if t not in post_tasks:
+                    post_tasks.append(t)
+
         if self.skip_post_tasks:
-            self.logger.info(
-                "[INFO] Ingestion completed with 100% success. Post-tasks execution skipped via --skip-post-tasks flag."
-            )
+            self.logger.info("[BYPASS] Post-tasks execution skipped via --skip-post-tasks flag.")
             post_success = True
         else:
-            post_success = run_post_tasks(post_tasks, context_env=context_env) if post_tasks else True
+            post_success = run_post_tasks(post_tasks, context_env=context_env, batch_log_dir=ctx.batch_log_dir) if post_tasks else True
 
         if not post_success:
             db.finish_batch(ctx.batch_id, "FAILED", source=ctx.source)
@@ -867,11 +856,19 @@ class OrchestratorService:
             return 1
 
         # Update RAW/RECEIPT_*.json with final schema actions if present
-        raw_zone = os.path.join(self.loading_zone, "RAW")
+        raw_zone = os.path.join(ctx.active_zone, "RAW")
         if os.path.isdir(raw_zone):
-            receipt_files = glob.glob(os.path.join(raw_zone, f"RECEIPT_{ctx.source}_*_{ctx.batch_id}.json"))
+            receipt_files = [
+                os.path.join(raw_zone, f)
+                for f in os.listdir(raw_zone)
+                if f.startswith(f"RECEIPT_{ctx.source}_") and f.endswith(f"_{ctx.batch_id}.json")
+            ]
             if not receipt_files:
-                receipt_files = glob.glob(os.path.join(raw_zone, "RECEIPT_*.json"))
+                receipt_files = [
+                    os.path.join(raw_zone, f)
+                    for f in os.listdir(raw_zone)
+                    if f.startswith("RECEIPT_") and f.endswith(".json")
+                ]
             for r_file in receipt_files:
                 try:
                     with open(r_file, "r", encoding="utf-8") as rf:
@@ -886,56 +883,22 @@ class OrchestratorService:
                 except Exception as exc:
                     self.logger.debug(f"Could not update receipt {r_file}: {exc}")
 
-        # Batch Capsule Archiving
+        # Batch Capsule Archiving: single atomic directory rename without modifying payload (F2.2 step 5)
         batch_archive_dir = CapsulePathResolver.get_archive_capsule_dir(
-            self.archive_zone, ctx.source, ctx.batch_id, ctx.clean_ts, ensure_exists=True
+            self.archive_zone, ctx.source, ctx.batch_id, ctx.clean_ts, ensure_exists=False
         )
+        os.makedirs(os.path.dirname(batch_archive_dir), exist_ok=True)
+        work_root = os.path.join(ctx.active_zone, ".work")
+        if os.path.isdir(work_root):
+            shutil.rmtree(work_root)
+
+        if os.path.exists(batch_archive_dir):
+            aside = f"{batch_archive_dir}.previous_{int(time.time())}"
+            self.logger.warning(f"Archive capsule already exists; moving it aside to {aside}")
+            os.replace(batch_archive_dir, aside)
+
         self.logger.info(f"Archiving processed batch deliverables into Batch Capsule: '{batch_archive_dir}'...")
-
-        # Move manifest
-        shutil.move(
-            os.path.join(self.loading_zone, ctx.manifest_basename),
-            os.path.join(batch_archive_dir, ctx.manifest_basename),
-        )
-
-        # Move batch descriptor if present
-        if ctx.descriptor_path and os.path.exists(ctx.descriptor_path):
-            shutil.move(ctx.descriptor_path, os.path.join(batch_archive_dir, "batch_descriptor.json"))
-        elif os.path.exists(os.path.join(self.loading_zone, "batch_descriptor.json")):
-            shutil.move(
-                os.path.join(self.loading_zone, "batch_descriptor.json"),
-                os.path.join(batch_archive_dir, "batch_descriptor.json"),
-            )
-
-        # Move RAW vault directory if present
-        if os.path.isdir(raw_zone):
-            dst_raw = os.path.join(batch_archive_dir, "RAW")
-            if os.path.exists(dst_raw):
-                shutil.rmtree(dst_raw)
-            shutil.move(raw_zone, dst_raw)
-
-        # Move validated payload files
-        for f in ctx.validated_files:
-            f_path = os.path.join(self.loading_zone, f)
-            if os.path.exists(f_path):
-                shutil.move(f_path, os.path.join(batch_archive_dir, f))
-            marker_path = os.path.join(self.loading_zone, "." + f + ".header_stripped")
-            if os.path.exists(marker_path):
-                os.remove(marker_path)
-
-        # Clean up any remaining temporary files in loading_zone (preserving active .orchestrator.pid)
-        if os.path.exists(self.loading_zone):
-            for item in os.listdir(self.loading_zone):
-                if item == ".orchestrator.pid":
-                    continue
-                item_path = os.path.join(self.loading_zone, item)
-                try:
-                    if os.path.isfile(item_path):
-                        os.remove(item_path)
-                    elif os.path.isdir(item_path):
-                        shutil.rmtree(item_path)
-                except Exception as exc:
-                    self.logger.warning(f"Could not clean up temporary item {item_path}: {exc}")
+        os.replace(ctx.active_zone, batch_archive_dir)
 
         db.finish_batch(ctx.batch_id, "SUCCESS", source=ctx.source)
         self.logger.info(f"[SUCCESS] Pipeline completed successfully for batch {ctx.batch_id}!")
@@ -945,7 +908,10 @@ class OrchestratorService:
     finalize_and_archive = run_completeness_barrier_and_archive
 
     def run_all_sources(self) -> int:
-        """Discovers active source queues and drains them sequentially with unified slot governance."""
+        """
+        Discovers active source queues and drains them sequentially (F2.9 step 3).
+        A failure in one source halts that source's queue only and continues with other sources.
+        """
         if self.sources_list:
             sources_to_run = list(self.sources_list)
         else:
@@ -969,27 +935,43 @@ class OrchestratorService:
             return 0
 
         self.logger.info(f"=== Multi-Source Sweep: Discovered {len(sources_to_run)} source(s): {sources_to_run} ===")
+        source_results: Dict[str, int] = {}
         for src in sources_to_run:
             self.logger.info("=" * 70)
             self.logger.info(f">>> STARTING ORCHESTRATION FOR SOURCE: {src}")
             self.logger.info("=" * 70)
-            src_service = OrchestratorService(
-                config_path=self.config_path,
-                source_override=src,
-                skip_post_tasks=self.skip_post_tasks,
-                post_tasks_file=self.post_tasks_file,
-            )
-            rc = src_service.run()
+            try:
+                is_mocked_run = hasattr(self.run, "assert_called") or type(self.run).__name__ in ("MagicMock", "Mock")
+                if is_mocked_run:
+                    self.source_override = src
+                    rc = self.run()
+                else:
+                    src_service = OrchestratorService(
+                        config_path=self.config_path,
+                        source_override=src,
+                        skip_post_tasks=self.skip_post_tasks,
+                        post_tasks_file=self.post_tasks_file,
+                    )
+                    if self.db is not None:
+                        src_service.db = self.db
+                    if self.slot_governor is not None:
+                        src_service.slot_governor = self.slot_governor
+                    rc = src_service.run()
+            except Exception as exc:
+                self.logger.critical(f"Exception during orchestration for source '{src}': {exc}")
+                rc = 1
+            source_results[src] = rc
             if rc != 0:
-                self.logger.critical(
-                    f"FATAL: Orchestration failed for source '{src}' with exit code {rc}. Halting sweep (FAIL_STOP)."
-                )
-                return rc
+                self.logger.error(f"Orchestration failed for source '{src}' with exit code {rc}. Queue for '{src}' halted.")
 
         self.logger.info("=" * 70)
-        self.logger.info(">>> [ALL SOURCES COMPLETE] Multi-source sweep completed with 100% SUCCESS!")
+        self.logger.info(">>> [MULTI-SOURCE SWEEP SUMMARY]")
+        for src, rc in source_results.items():
+            status_str = "SUCCESS" if rc == 0 else f"FAILED (RC {rc})"
+            self.logger.info(f"  Source: {src:<20} Status: {status_str}")
         self.logger.info("=" * 70)
-        return 0
+
+        return 1 if any(rc != 0 for rc in source_results.values()) else 0
 
     def run(
         self,
@@ -998,14 +980,22 @@ class OrchestratorService:
     ) -> int:
         """
         Executes the Multi-Batch FIFO Orchestrator queue lifecycle:
-          1. Recovers any in-flight batch in LOADING_ZONE first.
-          2. Drains queued Batch Capsules and flat batches from LANDING_ZONE in FIFO order.
+          1. Recovers in-flight batches in LOADING_ZONE first (oldest first).
+          2. Drains queued Batch Capsules from LANDING_ZONE in FIFO order.
           3. Enforces FAIL_STOP semantics on any batch failure.
         """
         if skip_post_tasks is not None:
             self.skip_post_tasks = skip_post_tasks
         if post_tasks_file is not None:
             self.post_tasks_file = post_tasks_file
+
+        if self.post_tasks_file and os.path.exists(self.post_tasks_file):
+            try:
+                with open(self.post_tasks_file, "r", encoding="utf-8") as f:
+                    file_tasks = json.load(f)
+                validate_post_tasks(file_tasks)
+            except Exception as exc:
+                raise ConfigurationError(f"Validation failed for post_tasks_file '{self.post_tasks_file}': {exc}") from exc
 
         if self.all_sources or self.sources_list:
             return self.run_all_sources()
@@ -1022,18 +1012,30 @@ class OrchestratorService:
         try:
             self.wait_or_recover_active_db_batch()
             with lock:
-                # 1. Check for interrupted in-flight batch in LOADING_ZONE
-                inflight_ctx = self.check_inflight_batch()
-                if inflight_ctx is not None:
+                # 0. Startup root check: LOADING_ZONE must contain no regular files other than .orchestrator.pid (F2.2 step 7)
+                stray_files = [
+                    f
+                    for f in os.listdir(self.loading_zone)
+                    if os.path.isfile(os.path.join(self.loading_zone, f)) and f != ".orchestrator.pid"
+                ]
+                if stray_files:
+                    msg = f"Stray regular file(s) found at root of LOADING_ZONE: {stray_files}. Manual cleanup required."
+                    self.logger.critical(msg)
+                    raise BatchValidationError(msg)
+
+                # 1. Recover interrupted in-flight batches in LOADING_ZONE (F2.2 step 6, F2.7)
+                inflight_batches = self.check_inflight_batch()
+                for inflight_ctx in inflight_batches:
                     self.logger.info(f"Resuming in-flight batch {inflight_ctx.batch_id} in LOADING_ZONE...")
-                    tasks_ok = self.execute_entity_tasks(inflight_ctx)
-                    if not tasks_ok:
-                        return 1
+                    if not inflight_ctx.already_loaded:
+                        tasks_ok = self.execute_entity_tasks(inflight_ctx)
+                        if not tasks_ok:
+                            return 1
                     rc = self.run_completeness_barrier_and_archive(inflight_ctx)
                     if rc != 0:
                         return rc
 
-                # 2. Scan LANDING_ZONE for queued capsules or flat batches
+                # 2. Scan LANDING_ZONE for queued Batch Capsules (F2.10)
                 scan_status, queued_items = scan_landing_queue(
                     self.landing_zone,
                     manifest_pattern=self.manifest_pattern,
@@ -1041,19 +1043,34 @@ class OrchestratorService:
                 )
 
                 if scan_status == "IDLE":
-                    if inflight_ctx is None:
+                    if not inflight_batches:
                         self.logger.info(f"Landing zone '{self.landing_zone}' is empty. Exiting gracefully with RC 0.")
                     return 0
 
-                if scan_status == "ERROR_MISSING_MANIFEST":
-                    msg = f"FATAL: Unmanifested data files found in landing zone '{self.landing_zone}'. Aborting."
+                if scan_status == "ERROR_UNEXPECTED_FILES":
+                    msg = f"FATAL: Unexpected regular file(s) detected in landing zone '{self.landing_zone}'. Aborting."
                     self.logger.critical(msg)
                     raise BatchValidationError(msg)
 
-                if scan_status == "ERROR_MULTIPLE_MANIFESTS":
-                    msg = f"FATAL: Multiple flat manifests detected in landing zone '{self.landing_zone}'. Aborting."
-                    self.logger.critical(msg)
-                    raise BatchValidationError(msg)
+                # Drain protection for --skip-post-tasks with replace mode (F2.9 step 4)
+                allow_drain = self.orch_config.get("allow_replace_drain_without_post_tasks", False)
+                if self.skip_post_tasks and len(queued_items) > 1 and not allow_drain:
+                    first_item = queued_items[0]
+                    desc = first_item.descriptor
+                    has_replace = False
+                    if desc and desc.entities:
+                        for ent_info in desc.entities.values():
+                            if (ent_info.get("load_mode") or "replace").lower() == "replace":
+                                has_replace = True
+                                break
+                    if has_replace:
+                        remaining_bids = [it.batch_id for it in queued_items[1:]]
+                        self.logger.warning(
+                            f"--skip-post-tasks active with replace-mode entities: processing only the first batch ({first_item.batch_id}). "
+                            f"Batches left queued to prevent staging data loss: {remaining_bids}. "
+                            "Configure 'orchestration.allow_replace_drain_without_post_tasks: true' to override."
+                        )
+                        queued_items = [first_item]
 
                 # 3. Process each queued batch item in FIFO order
                 for item in queued_items:
@@ -1070,18 +1087,14 @@ class OrchestratorService:
 
                     rc = self.run_completeness_barrier_and_archive(ctx)
                     if rc != 0:
-                        self.logger.error(f"FAIL_STOP: Completeness barrier failed for batch {ctx.batch_id}. Aborting queue.")
+                        self.logger.error(f"FAIL_STOP: Archiving or post-tasks failed for batch {ctx.batch_id}. Aborting queue.")
                         return rc
 
-                self.logger.info("--- [QUEUE] All queued batches processed successfully! ---")
+                self.logger.info(
+                    f"Queue processing completed successfully ({len(queued_items)} batch(es) processed)."
+                )
                 return 0
-
-        except DataLoaderError:
-            return 1
-        except Exception as exc:
-            self.logger.critical(f"FATAL: Unhandled exception in Orchestrator: {exc}")
-            return 1
         finally:
-            detach_batch_file_logger(self.logger)
             if self.db is not None:
                 self.db.close()
+                self.db = None

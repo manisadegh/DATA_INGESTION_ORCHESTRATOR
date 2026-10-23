@@ -7,7 +7,8 @@
   },
   "schema_guard": {
     "enabled": true,
-    "auto_migrate_ddl": true,
+    "auto_migrate_ddl": false,
+    "max_row_bytes": 64000,
     "default_column_type": "VARCHAR(4000)",
     "character_set": "UNICODE",
     "target_database": "${TDENV}SIDFINSTG"
@@ -31,7 +32,9 @@
     "manifest_regex": "^MANIFEST_([A-Za-z0-9_]+)_(\\d{8}_\\d{6})_([A-Za-z0-9_-]+)\\.MF$",
     "entity_mapping_file": "../../CONFIG/entity_mapping.csv",
     "verify_checksum": true,
+    "verify_checksum_on_queued_capsule": true,
     "allow_orphan_files": false,
+    "allow_replace_drain_without_post_tasks": false,
     "concurrency": {
       "poll_interval_seconds": 5,
       "lock_timeout_seconds": 7200
